@@ -1,0 +1,7 @@
+/target/
+/dist/
+.DS_Store
+*.log
+
+# Local runtime config belongs in ~/.config/cddock/config.toml.
+config.toml
