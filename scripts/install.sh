@@ -110,6 +110,30 @@ restore_steamos_readonly() {
 }
 
 install_arch_sdl_packages() {
+  local missing=()
+  local pkg
+
+  if ! command -v pacman >/dev/null 2>&1; then
+    msg "未检测到 pacman，跳过 SDL2 依赖检测。" \
+      "pacman was not found; skipping SDL2 dependency detection."
+    return 0
+  fi
+
+  for pkg in "${SDL_PACKAGES_ARCH[@]}"; do
+    if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    msg "SDL2 依赖已安装，跳过系统依赖修复。" \
+      "SDL2 dependencies are already installed; skipping system dependency repair."
+    return 0
+  fi
+
+  msg "缺少依赖：${missing[*]}" \
+    "Missing dependencies: ${missing[*]}"
+
   if [[ "$IS_STEAMOS" -eq 1 ]]; then
     msg "SteamOS 默认系统只读。安装 SDL2 依赖需要临时关闭只读模式，安装完成后会自动重新开启。" \
       "SteamOS uses a read-only system image by default. SDL2 dependency installation needs to temporarily disable read-only mode and will re-enable it afterward."
@@ -142,19 +166,38 @@ install_arch_sdl_packages() {
     run_as_root pacman -Syy
   fi
 
-  run_as_root pacman -S --needed "${SDL_PACKAGES_ARCH[@]}"
+  run_as_root pacman -S --needed "${missing[@]}"
 }
 
 install_macos_sdl_packages() {
+  local brew_packages=(sdl2 sdl2_image sdl2_mixer sdl2_ttf)
+  local missing=()
+  local pkg
+
   if ! command -v brew >/dev/null 2>&1; then
     msg "未检测到 Homebrew。macOS 版本建议先安装 Homebrew，再安装 SDL2 依赖。" \
       "Homebrew was not found. On macOS, install Homebrew first, then install SDL2 dependencies."
     return 0
   fi
 
+  for pkg in "${brew_packages[@]}"; do
+    if ! brew list --formula "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    msg "SDL2 依赖已安装，跳过 Homebrew 安装。" \
+      "SDL2 dependencies are already installed; skipping Homebrew install."
+    return 0
+  fi
+
+  msg "缺少依赖：${missing[*]}" \
+    "Missing dependencies: ${missing[*]}"
+
   if ask_yes_no "是否通过 Homebrew 安装 CDDA tiles 所需 SDL2 依赖？" \
     "Install SDL2 dependencies required by CDDA tiles through Homebrew?"; then
-    brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
+    brew install "${missing[@]}"
   fi
 }
 
