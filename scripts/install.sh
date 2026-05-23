@@ -421,6 +421,86 @@ PY
     "Fully quit and reopen Steam for the new CDDock non-Steam game to appear."
 }
 
+steam_shortcut_current() {
+  local target_path="$1"
+  local config_dir
+  local shortcut_file
+  local real_shortcut
+  local seen_shortcuts=""
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+
+  shopt -s nullglob
+  for config_dir in "${HOME}/.local/share/Steam/userdata"/*/config "${HOME}/.steam/steam/userdata"/*/config; do
+    [[ -d "$config_dir" ]] || continue
+    shortcut_file="${config_dir}/shortcuts.vdf"
+    [[ -f "$shortcut_file" ]] || continue
+    real_shortcut="$(readlink -f "$shortcut_file" 2>/dev/null || printf '%s' "$shortcut_file")"
+    case " ${seen_shortcuts} " in
+      *" ${real_shortcut} "*) continue ;;
+    esac
+    seen_shortcuts="${seen_shortcuts} ${real_shortcut}"
+    if CDDOCK_SHORTCUTS_VDF="$shortcut_file" CDDOCK_BIN="$target_path" python3 <<'PY'
+import os
+import struct
+from pathlib import Path
+
+path = Path(os.environ["CDDOCK_SHORTCUTS_VDF"])
+cddock = os.environ["CDDOCK_BIN"]
+home = str(Path.home())
+expected = {
+    "AppName": "CDDock",
+    "Exe": '"/usr/bin/konsole"',
+    "StartDir": f'"{home}"',
+    "LaunchOptions": f'--workdir "{home}" --nofork -e "{cddock}"',
+}
+
+def read_cstr(data, pos):
+    end = data.index(b"\x00", pos)
+    return data[pos:end].decode("utf-8", "replace"), end + 1
+
+def parse_object(data, pos):
+    obj = {}
+    while pos < len(data):
+        typ = data[pos]
+        pos += 1
+        if typ == 8:
+            break
+        key, pos = read_cstr(data, pos)
+        if typ == 0:
+            value, pos = parse_object(data, pos)
+        elif typ == 1:
+            value, pos = read_cstr(data, pos)
+        elif typ == 2:
+            value = struct.unpack_from("<i", data, pos)[0]
+            pos += 4
+        else:
+            raise ValueError(f"unsupported vdf type {typ}")
+        obj[key] = (typ, value)
+    return obj, pos
+
+try:
+    root, _ = parse_object(path.read_bytes(), 0)
+except Exception:
+    raise SystemExit(1)
+
+shortcuts = root.get("shortcuts", (0, {}))[1]
+for _, (_, entry) in shortcuts.items():
+    if all(entry.get(key, (None, None))[1] == value for key, value in expected.items()):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
 steam_shortcut_prompt() {
   local target_path="$1"
   local default="no"
@@ -430,6 +510,12 @@ steam_shortcut_prompt() {
   fi
 
   if [[ "${CDDOCK_ADD_STEAM:-}" == "0" ]]; then
+    return 0
+  fi
+
+  if [[ "${CDDOCK_ADD_STEAM:-}" != "1" ]] && steam_shortcut_current "$target_path"; then
+    msg "Steam 中已存在当前 CDDock 快捷方式，跳过添加。" \
+      "The current CDDock Steam shortcut already exists; skipping."
     return 0
   fi
 

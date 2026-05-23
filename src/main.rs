@@ -1663,13 +1663,14 @@ fn draw_home_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let logo = Paragraph::new(vec![
         Line::from(""),
-        Line::from("        ______  ______  ______   ______  "),
-        Line::from("       / ____/ / __  / / __  /  / ____/  "),
-        Line::from("      / /     / / / / / / / /  / /_      "),
-        Line::from("     / /___  / /_/ / / /_/ /  / __/      "),
-        Line::from("     \\____/ /_____/ /_____/  /_/         "),
+        Line::from("   ██████╗██████╗ ██████╗  █████╗ "),
+        Line::from("  ██╔════╝██╔══██╗██╔══██╗██╔══██╗"),
+        Line::from("  ██║     ██║  ██║██║  ██║███████║"),
+        Line::from("  ██║     ██║  ██║██║  ██║██╔══██║"),
+        Line::from("  ╚██████╗██████╔╝██████╔╝██║  ██║"),
+        Line::from("   ╚═════╝╚═════╝ ╚═════╝ ╚═╝  ╚═╝"),
         Line::from(""),
-        Line::from("        Cataclysm: Dark Days Ahead"),
+        Line::from("      Cataclysm: Dark Days Ahead"),
     ])
     .block(
         Block::default()
