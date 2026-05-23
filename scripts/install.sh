@@ -218,7 +218,7 @@ release_target() {
 }
 
 install_binary() {
-  local target_dir target_path target version url tmp archive binary
+  local target_dir target_path target version url tmp archive binary tmp_target
   local script_dir
 
   if [[ "$IS_STEAMOS" -eq 1 ]] && [[ -d /home/deck ]]; then
@@ -236,8 +236,10 @@ install_binary() {
   if [[ -x "${script_dir}/cddock" ]]; then
     msg "正在安装本地安装包中的 ${APP_NAME}。" \
       "Installing ${APP_NAME} from the local package."
-    cp "${script_dir}/cddock" "$target_path"
-    chmod +x "$target_path"
+    tmp_target="$(mktemp "${target_dir}/.${APP_NAME}.XXXXXX")"
+    cp "${script_dir}/cddock" "$tmp_target"
+    chmod +x "$tmp_target"
+    mv -f "$tmp_target" "$target_path"
     INSTALLED_BINARY_PATH="$target_path"
     msg "已安装 ${APP_NAME} 到：${target_path}" \
       "Installed ${APP_NAME} to: ${target_path}"
@@ -262,8 +264,10 @@ install_binary() {
       "Could not find cddock binary in the package."
     exit 1
   fi
-  cp "$binary" "$target_path"
-  chmod +x "$target_path"
+  tmp_target="$(mktemp "${target_dir}/.${APP_NAME}.XXXXXX")"
+  cp "$binary" "$tmp_target"
+  chmod +x "$tmp_target"
+  mv -f "$tmp_target" "$target_path"
   INSTALLED_BINARY_PATH="$target_path"
 
   msg "已安装 ${APP_NAME} 到：${target_path}" \
