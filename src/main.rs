@@ -212,6 +212,7 @@ enum Action {
     SteamShortcutName,
     Controls,
     BackToHome,
+    QuitCddock,
 }
 
 impl Action {
@@ -234,6 +235,7 @@ impl Action {
             Self::SteamShortcutName => language.text("Steam shortcut name", "Steam 快捷方式名称"),
             Self::Controls => language.text("Controls", "控制"),
             Self::BackToHome => language.text("Back to Home", "返回首页"),
+            Self::QuitCddock => language.text("Quit CDDock", "退出 CDDock"),
         }
     }
 
@@ -250,6 +252,7 @@ impl Action {
             }
             Self::BackToBuilds | Self::BackToHome => "NAV",
             Self::SelectExistingBuild | Self::ShowActiveBuild => "USE",
+            Self::QuitCddock => "EXT",
         }
     }
 }
@@ -583,7 +586,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.previous_item(),
             KeyCode::Char('j') | KeyCode::Down => self.next_item(),
             KeyCode::Esc => {
-                if self.focus == Focus::Actions {
+                if self.page() == Page::Home {
+                    return true;
+                } else if self.focus == Focus::Actions {
                     self.focus_pages();
                 } else {
                     self.open_page(Page::Home);
@@ -596,6 +601,8 @@ impl App {
             KeyCode::Enter => {
                 if self.focus == Focus::Pages {
                     self.focus_actions();
+                } else if self.actions().get(self.action_index) == Some(&Action::QuitCddock) {
+                    return true;
                 } else {
                     self.activate();
                 }
@@ -1364,6 +1371,10 @@ impl App {
                     .text("Returned to versions.", "已返回版本页。")
                     .to_string()
             }
+            Some(Action::QuitCddock) => self
+                .language
+                .text("Quit requested.", "准备退出。")
+                .to_string(),
             None => self
                 .language
                 .text("No action selected.", "未选择动作。")
@@ -1403,6 +1414,7 @@ fn page_actions(page: Page) -> &'static [Action] {
             Action::SelectExistingBuild,
             Action::LaunchCdda,
             Action::QuickResume,
+            Action::QuitCddock,
         ],
         Page::Builds => &[
             Action::InstallGame,
@@ -1672,16 +1684,17 @@ fn draw_home_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
     .alignment(Alignment::Center);
     frame.render_widget(logo, chunks[0]);
 
+    let actions = app.actions();
+    let columns = actions.len().max(1) as u32;
+    let constraints = (0..actions.len())
+        .map(|_| Constraint::Ratio(1, columns))
+        .collect::<Vec<_>>();
     let action_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
+        .constraints(constraints)
         .split(chunks[1]);
 
-    for (index, action) in app.actions().iter().enumerate() {
+    for (index, action) in actions.iter().enumerate() {
         let selected = index == app.action_index && app.focus == Focus::Actions;
         let style = if selected {
             Style::default()
