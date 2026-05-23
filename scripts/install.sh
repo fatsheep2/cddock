@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="cddock"
 REPO="fatsheep2/cddock"
 STEAM_SHORTCUT_RECOMMENDED_NAME="Cataclysm: Dark Days Ahead"
-SDL_PACKAGES_ARCH=(sdl2 sdl2_image sdl2_mixer sdl2_ttf)
+SDL_PACKAGES_ARCH=(sdl2 sdl2_image sdl2_mixer sdl2_ttf freetype2 zip)
 
 LANG_CHOICE="${CDDOCK_LANG:-auto}"
 IS_STEAMOS=0
@@ -280,6 +280,8 @@ add_steam_shortcut() {
   local added=0
   local config_dir
   local shortcut_file
+  local real_shortcut
+  local seen_shortcuts=""
 
   if ! command -v python3 >/dev/null 2>&1; then
     msg "未检测到 python3，无法自动写入 Steam 快捷方式。" \
@@ -291,6 +293,11 @@ add_steam_shortcut() {
   for config_dir in "${HOME}/.local/share/Steam/userdata"/*/config "${HOME}/.steam/steam/userdata"/*/config; do
     [[ -d "$config_dir" ]] || continue
     shortcut_file="${config_dir}/shortcuts.vdf"
+    real_shortcut="$(readlink -f "$shortcut_file" 2>/dev/null || printf '%s' "$shortcut_file")"
+    case " ${seen_shortcuts} " in
+      *" ${real_shortcut} "*) continue ;;
+    esac
+    seen_shortcuts="${seen_shortcuts} ${real_shortcut}"
     CDDOCK_SHORTCUTS_VDF="$shortcut_file" \
     CDDOCK_BIN="$target_path" \
     python3 <<'PY'

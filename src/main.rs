@@ -136,20 +136,16 @@ enum Page {
     Builds,
     Install,
     Guide,
-    Dependencies,
-    Steam,
     Settings,
     Help,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 6] = [
         Page::Home,
         Page::Builds,
         Page::Install,
         Page::Guide,
-        Page::Dependencies,
-        Page::Steam,
         Page::Settings,
         Page::Help,
     ];
@@ -160,8 +156,6 @@ impl Page {
             Page::Builds => language.text("Versions", "版本"),
             Page::Install => language.text("Install", "安装"),
             Page::Guide => language.text("Guide", "图鉴"),
-            Page::Dependencies => language.text("Dependencies", "依赖"),
-            Page::Steam => "Steam",
             Page::Settings => language.text("Settings", "设置"),
             Page::Help => language.text("Help", "帮助"),
         }
@@ -173,8 +167,6 @@ impl Page {
             Page::Builds => "V",
             Page::Install => "+",
             Page::Guide => "G",
-            Page::Dependencies => "!",
-            Page::Steam => "S",
             Page::Settings => "*",
             Page::Help => "?",
         }
@@ -194,11 +186,6 @@ impl Page {
                 "Search cdda-guide data with local cache",
                 "搜索 cdda-guide 数据并本地缓存",
             ),
-            Page::Dependencies => language.text(
-                "Detect and repair native tiles dependencies",
-                "检测并修复原生图形版依赖",
-            ),
-            Page::Steam => language.text("Game mode shortcuts", "游戏模式快捷方式"),
             Page::Settings => language.text("Language, paths, and controls", "语言、路径和控制"),
             Page::Help => language.text(
                 "Keyboard and Steam Input mapping",
@@ -220,22 +207,9 @@ enum Action {
     SearchGuide,
     ShowGuideVersion,
     ShowActiveBuild,
-    CheckDependencyStatus,
-    RepairDependencies,
-    ExplainDependencyRepair,
-    AddCddockToSteam,
-    AddCddaToSteam,
-    UseCommunityLayoutName,
-    OpenShortcutStatus,
-    ShowLanguage,
     ToggleLanguage,
     ShowConfigPath,
-    CddaPath,
-    GameRoot,
-    ActiveBuild,
-    ReleaseChannel,
     SteamShortcutName,
-    ToggleSteamDeckKonsole,
     Controls,
     BackToHome,
 }
@@ -255,33 +229,9 @@ impl Action {
             Self::SearchGuide => language.text("Search guide data", "搜索图鉴数据"),
             Self::ShowGuideVersion => language.text("Show guide version", "查看图鉴版本"),
             Self::ShowActiveBuild => language.text("Show active build", "查看当前版本"),
-            Self::CheckDependencyStatus => language.text("Check dependency status", "检查依赖状态"),
-            Self::RepairDependencies => {
-                language.text("Repair missing dependencies", "修复缺失依赖")
-            }
-            Self::ExplainDependencyRepair => language.text("Explain repair plan", "说明修复流程"),
-            Self::AddCddockToSteam => {
-                language.text("Add CDDock TUI to Steam", "添加 CDDock 到 Steam")
-            }
-            Self::AddCddaToSteam => {
-                language.text("Add CDDA gameplay shortcut", "添加 CDDA 游戏快捷方式")
-            }
-            Self::UseCommunityLayoutName => {
-                language.text("Use community layout name", "使用社区布局匹配名称")
-            }
-            Self::OpenShortcutStatus => language.text("Open shortcut status", "查看快捷方式状态"),
-            Self::ShowLanguage => language.text("Current language", "当前语言"),
             Self::ToggleLanguage => language.text("Switch language", "切换语言"),
-            Self::ShowConfigPath => language.text("Config file", "配置文件"),
-            Self::CddaPath => language.text("CDDA path", "CDDA 路径"),
-            Self::GameRoot => language.text("Game library", "游戏版本库"),
-            Self::ActiveBuild => language.text("Active build", "当前版本"),
-            Self::ReleaseChannel => language.text("Release channel", "发布通道"),
+            Self::ShowConfigPath => language.text("Show config path", "显示配置路径"),
             Self::SteamShortcutName => language.text("Steam shortcut name", "Steam 快捷方式名称"),
-            Self::ToggleSteamDeckKonsole => language.text(
-                "Toggle Konsole game-mode entry",
-                "切换 Konsole 游戏模式入口",
-            ),
             Self::Controls => language.text("Controls", "控制"),
             Self::BackToHome => language.text("Back to Home", "返回首页"),
         }
@@ -290,28 +240,16 @@ impl Action {
     fn badge(self) -> &'static str {
         match self {
             Self::LaunchCdda | Self::QuickResume => "RUN",
-            Self::CheckDependencyStatus => "CHK",
             Self::SearchGuide | Self::ShowGuideVersion => "GDE",
-            Self::ShowLanguage
-            | Self::ToggleLanguage
+            Self::ToggleLanguage
             | Self::ShowConfigPath
-            | Self::CddaPath
-            | Self::GameRoot
-            | Self::ActiveBuild
-            | Self::ReleaseChannel
             | Self::SteamShortcutName
-            | Self::ToggleSteamDeckKonsole
             | Self::Controls => "SET",
             Self::InstallGame | Self::SelectStableChannel | Self::SelectExperimentalChannel => {
                 "GET"
             }
             Self::BackToBuilds | Self::BackToHome => "NAV",
             Self::SelectExistingBuild | Self::ShowActiveBuild => "USE",
-            Self::RepairDependencies | Self::ExplainDependencyRepair => "FIX",
-            Self::AddCddockToSteam
-            | Self::AddCddaToSteam
-            | Self::UseCommunityLayoutName
-            | Self::OpenShortcutStatus => "STM",
         }
     }
 }
@@ -1336,7 +1274,10 @@ impl App {
             Some(Action::InstallGame) => {
                 self.open_page(Page::Install);
                 self.language
-                    .text("Choose stable or experimental downloads.", "选择稳定版或实验版下载。")
+                    .text(
+                        "Choose stable or experimental downloads.",
+                        "选择稳定版或实验版下载。",
+                    )
                     .to_string()
             }
             Some(Action::BackToHome) => {
@@ -1351,16 +1292,6 @@ impl App {
                     .text("Opened controls help.", "已打开控制帮助。")
                     .to_string()
             }
-            Some(Action::ShowLanguage) => format!(
-                "{}: {} ({})",
-                self.language.text("Current language", "当前语言"),
-                self.language.name(),
-                if self.config.language.is_some() {
-                    self.language.text("saved", "已保存")
-                } else {
-                    self.language.text("system default", "系统默认")
-                }
-            ),
             Some(Action::ToggleLanguage) => {
                 self.language = self.language.toggle();
                 self.config.language = Some(self.language.config_value().to_string());
@@ -1375,49 +1306,24 @@ impl App {
                 self.language.text("Config file", "配置文件"),
                 self.config_path.display()
             ),
-            Some(Action::CddaPath) => format!(
-                "{}: {}",
-                self.language.text("CDDA path", "CDDA 路径"),
-                self.config.cdda_path
-            ),
-            Some(Action::GameRoot) => format!(
-                "{}: {}",
-                self.language.text("Game library", "游戏版本库"),
-                self.game_root().display()
-            ),
-            Some(Action::ActiveBuild) | Some(Action::ShowActiveBuild) => {
+            Some(Action::ShowActiveBuild) => {
                 let active = if self.config.active_build.is_empty() {
                     self.language.text("none selected", "未选择")
                 } else {
                     self.config.active_build.as_str()
                 };
-                format!("{}: {}", self.language.text("Active build", "当前版本"), active)
+                format!(
+                    "{}: {}",
+                    self.language.text("Active build", "当前版本"),
+                    active
+                )
             }
-            Some(Action::ReleaseChannel) => format!(
-                "{}: {}",
-                self.language.text("Release channel", "发布通道"),
-                self.config.release_channel
-            ),
             Some(Action::SteamShortcutName) => format!(
                 "{}: {}",
                 self.language
                     .text("Steam shortcut name", "Steam 快捷方式名称"),
                 self.config.steam_shortcut_name
             ),
-            Some(Action::ToggleSteamDeckKonsole) => {
-                self.config.use_steam_deck_konsole = !self.config.use_steam_deck_konsole;
-                let status = if self.config.use_steam_deck_konsole {
-                    self.language.text("enabled", "已启用")
-                } else {
-                    self.language.text("disabled", "已关闭")
-                };
-                self.save_config_message(format!(
-                    "{}: {}",
-                    self.language
-                        .text("Konsole game-mode entry", "Konsole 游戏模式入口"),
-                    status
-                ))
-            }
             Some(Action::SelectStableChannel) => {
                 self.config.release_channel = String::from("stable");
                 let _ = self.config.save(&self.config_path);
@@ -1458,60 +1364,6 @@ impl App {
                     .text("Returned to versions.", "已返回版本页。")
                     .to_string()
             }
-            Some(Action::CheckDependencyStatus) => self
-                .language
-                .text(
-                    "Dependency detection is not implemented yet.",
-                    "依赖检测尚未实现。",
-                )
-                .to_string(),
-            Some(Action::RepairDependencies) => self
-                .language
-                .text(
-                    "Dependency repair is not implemented yet. Use scripts/install.sh.",
-                    "依赖修复尚未实现，请使用 scripts/install.sh。",
-                )
-                .to_string(),
-            Some(Action::ExplainDependencyRepair) => self
-                .language
-                .text(
-                    "Repair flow is triggered after missing SDL detection and then asks for confirmation.",
-                    "修复流程会在检测到 SDL 缺失后触发，然后再询问确认。",
-                )
-                .to_string(),
-            Some(Action::AddCddockToSteam) => self
-                .language
-                .text(
-                    "Steam integration is not implemented yet.",
-                    "Steam 集成尚未实现。",
-                )
-                .to_string(),
-            Some(Action::AddCddaToSteam) => self
-                .language
-                .text(
-                    "Steam integration is not implemented yet.",
-                    "Steam 集成尚未实现。",
-                )
-                .to_string(),
-            Some(Action::UseCommunityLayoutName) => {
-                self.config.steam_shortcut_name =
-                    String::from("Cataclysm: Dark Days Ahead");
-                self.save_config_message(
-                    self.language
-                        .text(
-                            "Shortcut name set to community layout default.",
-                            "快捷方式名称已设为社区布局默认值。",
-                        )
-                        .to_string(),
-                )
-            }
-            Some(Action::OpenShortcutStatus) => self
-                .language
-                .text(
-                    "Steam shortcut status is not implemented yet.",
-                    "Steam 快捷方式状态尚未实现。",
-                )
-                .to_string(),
             None => self
                 .language
                 .text("No action selected.", "未选择动作。")
@@ -1567,27 +1419,10 @@ fn page_actions(page: Page) -> &'static [Action] {
             Action::ShowGuideVersion,
             Action::BackToHome,
         ],
-        Page::Dependencies => &[
-            Action::CheckDependencyStatus,
-            Action::RepairDependencies,
-            Action::ExplainDependencyRepair,
-        ],
-        Page::Steam => &[
-            Action::AddCddockToSteam,
-            Action::AddCddaToSteam,
-            Action::UseCommunityLayoutName,
-            Action::OpenShortcutStatus,
-        ],
         Page::Settings => &[
-            Action::ShowLanguage,
             Action::ToggleLanguage,
             Action::ShowConfigPath,
-            Action::CddaPath,
-            Action::GameRoot,
-            Action::ActiveBuild,
-            Action::ReleaseChannel,
             Action::SteamShortcutName,
-            Action::ToggleSteamDeckKonsole,
             Action::Controls,
         ],
         Page::Help => &[Action::BackToHome],
@@ -1720,7 +1555,7 @@ fn draw_nav(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_page(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let intro_height = if app.page() == Page::Home { 13 } else { 8 };
+    let intro_height = if app.page() == Page::Home { 5 } else { 8 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(intro_height), Constraint::Min(8)])
@@ -1744,6 +1579,11 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_actions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.page() == Page::Home {
+        draw_home_panel(frame, area, app);
+        return;
+    }
+
     if app.page() == Page::Guide
         && let Some(search) = &app.guide_search
     {
@@ -1800,6 +1640,62 @@ fn draw_actions(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if app.page() == Page::Help {
         draw_help_overlay(frame, area, app.language);
+    }
+}
+
+fn draw_home_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(12), Constraint::Length(5)])
+        .split(area);
+
+    let logo = Paragraph::new(vec![
+        Line::from(""),
+        Line::from("        ______  ______  ______   ______  "),
+        Line::from("       / ____/ / __  / / __  /  / ____/  "),
+        Line::from("      / /     / / / / / / / /  / /_      "),
+        Line::from("     / /___  / /_/ / / /_/ /  / __/      "),
+        Line::from("     \\____/ /_____/ /_____/  /_/         "),
+        Line::from(""),
+        Line::from("        Cataclysm: Dark Days Ahead"),
+    ])
+    .block(
+        Block::default()
+            .title(format!(" {} ", app.language.text("Launch Dock", "启动台")))
+            .borders(Borders::ALL)
+            .border_style(if app.focus == Focus::Actions {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }),
+    )
+    .alignment(Alignment::Center);
+    frame.render_widget(logo, chunks[0]);
+
+    let action_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(chunks[1]);
+
+    for (index, action) in app.actions().iter().enumerate() {
+        let selected = index == app.action_index && app.focus == Focus::Actions;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let button = Paragraph::new(action.label(app.language))
+            .block(Block::default().borders(Borders::ALL).border_style(style))
+            .alignment(Alignment::Center)
+            .style(style);
+        frame.render_widget(button, action_chunks[index]);
     }
 }
 
@@ -2049,11 +1945,35 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
             Span::raw(format!("  [{}] [{}]", search.build, search.language)),
         ]),
         Line::from(vec![
-            Span::styled("[Q] ", Style::default().fg(Color::Yellow)),
-            Span::raw(search.query.as_str()),
+            Span::styled(
+                "[Q] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if search.query.is_empty() {
+                    language.text("type to search", "输入关键词搜索")
+                } else {
+                    search.query.as_str()
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                language.text(" Enter searches / opens", " Enter 搜索 / 打开"),
+                Style::default().fg(Color::Gray),
+            ),
         ]),
     ])
-    .block(Block::default().borders(Borders::ALL));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
     frame.render_widget(header, chunks[0]);
 
     if let Some(detail) = &search.detail {
@@ -2244,15 +2164,8 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
         app.config.active_build.clone()
     };
 
-    match app.page() {
+    let mut lines = match app.page() {
         Page::Home => vec![
-            Line::from("   _____ ____  ____    ___    "),
-            Line::from("  / ___// __ \\/ __ \\  /   |   "),
-            Line::from(" / /   / / / / / / / / /| |   "),
-            Line::from("/ /___/ /_/ / /_/ / / ___ |   "),
-            Line::from("\\____/_____/_____/ /_/  |_|   "),
-            Line::from(" Cataclysm: Dark Days Ahead"),
-            Line::from(""),
             kv_line("BUILD", active, Color::Green),
             kv_line(
                 "FLOW",
@@ -2355,38 +2268,14 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
                 ),
             ]
         }
-        Page::Dependencies => vec![
-            kv_line(
-                "STATUS",
-                language.text("not implemented", "尚未实现"),
-                Color::Yellow,
-            ),
-            kv_line("SDL2", "sdl2 / image / mixer / ttf", Color::Cyan),
-            kv_line(
-                "REPAIR",
-                language.text(
-                    "Use scripts/install.sh for now.",
-                    "目前请使用 scripts/install.sh。",
-                ),
-                Color::Gray,
-            ),
-        ],
-        Page::Steam => vec![
-            kv_line("TUI", "CDDock via Konsole", Color::Cyan),
-            kv_line("GAME", app.config.steam_shortcut_name.clone(), Color::Green),
-            kv_line(
-                "LAYOUT",
-                language.text(
-                    "Steam integration is not implemented yet.",
-                    "Steam 集成尚未实现。",
-                ),
-                Color::Gray,
-            ),
-        ],
         Page::Settings => vec![
-            kv_line("LANG", language.name(), Color::Cyan),
             kv_line("CONFIG", app.config_path.display().to_string(), Color::Gray),
             kv_line("ROOT", app.config.game_root.clone(), Color::Cyan),
+            kv_line(
+                "STEAM",
+                app.config.steam_shortcut_name.clone(),
+                Color::Green,
+            ),
         ],
         Page::Help => vec![
             kv_line(
@@ -2408,7 +2297,9 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
                 Color::Gray,
             ),
         ],
-    }
+    };
+    lines.push(kv_line("MSG", app.message.clone(), Color::Gray));
+    lines
 }
 
 fn kv_line<'a>(

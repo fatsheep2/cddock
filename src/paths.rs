@@ -65,6 +65,10 @@ pub fn guide_cache_dir(game_root: &Path) -> PathBuf {
     game_root.join("cache").join("guide")
 }
 
+pub fn logs_dir(game_root: &Path) -> PathBuf {
+    game_root.join("logs")
+}
+
 /// Directories shared across all game installs (Catapult userdata migration set).
 pub const SHARED_USER_DIRS: &[&str] = &[
     "save",
