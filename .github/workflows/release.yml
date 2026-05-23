@@ -50,6 +50,11 @@ jobs:
           fi
           archive="$(scripts/package-release.sh "${{ matrix.target }}" "${version}")"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF_TYPE:-}" == "branch" && "${GITHUB_REF_NAME:-}" == "dev" ]]; then
+            dev_snapshot="dist/cddock-dev-snapshot-${{ matrix.target }}.tar.gz"
+            cp "$archive" "$dev_snapshot"
+            echo "dev_snapshot=${dev_snapshot}" >> "$GITHUB_OUTPUT"
+          fi
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             latest="dist/cddock-latest-${{ matrix.target }}.tar.gz"
             cp "$archive" "$latest"
@@ -70,3 +75,15 @@ jobs:
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.latest }}
+
+      - name: Upload dev snapshot release asset
+        if: github.ref_type == 'branch' && github.ref_name == 'dev'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-snapshot
+          name: CDDock dev snapshot
+          body: Automated dev build from ${{ github.sha }}.
+          prerelease: true
+          make_latest: false
+          files: |
+            ${{ steps.package.outputs.dev_snapshot }}
