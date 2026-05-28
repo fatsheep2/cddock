@@ -7,7 +7,10 @@ use std::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::{http, paths::guide_cache_dir};
+use crate::{
+    http,
+    paths::{build_dir, guide_cache_dir},
+};
 
 const BUILDS_URL: &str = "https://raw.githubusercontent.com/nornagon/cdda-data/main/builds.json";
 const DATA_BASE_URL: &str = "https://raw.githubusercontent.com/nornagon/cdda-data/main/data";
@@ -171,6 +174,111 @@ pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<
         .take(limit)
         .cloned()
         .collect()
+}
+
+pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut GuideSearchResult) {
+    if active_build.trim().is_empty() {
+        return;
+    }
+    let build_path = build_dir(game_root, active_build);
+    let matches = find_tile_matches(&build_path, &result.id);
+    if matches.is_empty() {
+        result.fields.push((
+            "tile_match".to_string(),
+            "no local tileset entry found under active build gfx/".to_string(),
+        ));
+        return;
+    }
+
+    for item in matches.into_iter().take(6) {
+        result.fields.push(("tile_match".to_string(), item));
+    }
+}
+
+fn find_tile_matches(build_path: &Path, id: &str) -> Vec<String> {
+    let gfx = build_path.join("gfx");
+    if !gfx.is_dir() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let Ok(tilesets) = fs::read_dir(gfx) else {
+        return matches;
+    };
+    for entry in tilesets.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let config = entry.path().join("tile_config.json");
+        if !config.is_file() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&config) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let tileset = entry.file_name().to_string_lossy().into_owned();
+        collect_tile_matches(&value, id, &tileset, None, &mut matches);
+    }
+    matches
+}
+
+fn collect_tile_matches(
+    value: &Value,
+    id: &str,
+    tileset: &str,
+    sheet: Option<&str>,
+    matches: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            let current_sheet = map.get("file").and_then(|value| value.as_str()).or(sheet);
+            if map
+                .get("id")
+                .is_some_and(|value| tile_id_matches(value, id))
+            {
+                matches.push(tile_match_summary(map, tileset, current_sheet));
+            }
+            for child in map.values() {
+                collect_tile_matches(child, id, tileset, current_sheet, matches);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_tile_matches(child, id, tileset, sheet, matches);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tile_id_matches(value: &Value, id: &str) -> bool {
+    match value {
+        Value::String(text) => text == id,
+        Value::Array(values) => values.iter().any(|value| tile_id_matches(value, id)),
+        _ => false,
+    }
+}
+
+fn tile_match_summary(map: &Map<String, Value>, tileset: &str, sheet: Option<&str>) -> String {
+    let mut parts = vec![format!("tileset: {tileset}")];
+    if let Some(sheet) = sheet {
+        parts.push(format!("sheet: {sheet}"));
+    }
+    for key in ["fg", "bg", "multitile", "rotates", "additional_tiles"] {
+        if let Some(value) = map
+            .get(key)
+            .and_then(|value| compact_value(value, &HashMap::new()))
+        {
+            parts.push(format!("{key}: {value}"));
+        }
+    }
+    parts.join("; ")
 }
 
 fn load_translations_with_fallback(
@@ -771,6 +879,48 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "used_by_recipe" && value.contains("long_pole"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn add_local_tile_info_reads_tile_config_matches() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-tile-test-{}", std::process::id()));
+        let build = "test-build";
+        let tileset = build_dir(&root, build).join("gfx").join("TestTiles");
+        fs::create_dir_all(&tileset).expect("tileset dir");
+        fs::write(
+            tileset.join("tile_config.json"),
+            r#"{
+                "tiles-new": [
+                    {
+                        "file": "items.png",
+                        "tiles": [
+                            {"id": ["long_pole", "stick_long"], "fg": 42, "bg": 0}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("tile config");
+
+        let mut result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: Vec::new(),
+            raw_json: String::new(),
+        };
+        add_local_tile_info(&root, build, &mut result);
+
+        assert!(result.fields.iter().any(|(key, value)| {
+            key == "tile_match"
+                && value.contains("TestTiles")
+                && value.contains("items.png")
+                && value.contains("fg: 42")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

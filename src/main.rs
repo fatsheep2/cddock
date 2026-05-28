@@ -822,13 +822,16 @@ impl App {
     }
 
     fn confirm_guide_search(&mut self) {
+        let game_root = self.game_root();
+        let active_build = self.config.active_build.clone();
         let Some(search) = self.guide_search.as_mut() else {
             return;
         };
         if search.detail.is_some() {
             return;
         }
-        if let Some(result) = search.results.get(search.index).cloned() {
+        if let Some(mut result) = search.results.get(search.index).cloned() {
+            guide::add_local_tile_info(&game_root, &active_build, &mut result);
             search.detail = Some(result);
             return;
         }
