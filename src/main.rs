@@ -1989,6 +1989,15 @@ fn draw_guide_detail(
     for (key, value) in &detail.fields {
         lines.push(kv_line("DATA", format!("{key}: {value}"), Color::Gray));
     }
+    if !detail.raw_json.is_empty() {
+        let mut raw = detail.raw_json.clone();
+        const RAW_LIMIT: usize = 900;
+        if raw.len() > RAW_LIMIT {
+            raw.truncate(RAW_LIMIT);
+            raw.push_str(" ...");
+        }
+        lines.push(kv_line("RAW", raw, Color::DarkGray));
+    }
 
     let paragraph = Paragraph::new(lines)
         .block(

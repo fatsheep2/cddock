@@ -28,6 +28,7 @@ pub struct GuideSearchResult {
     pub name: String,
     pub description: String,
     pub fields: Vec<(String, String)>,
+    pub raw_json: String,
 }
 
 #[derive(Debug)]
@@ -121,6 +122,7 @@ pub fn load_dataset(game_root: &Path, build: &str, language: &str) -> Result<Gui
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     collect_entries(&data, &translations, &mut seen, &mut entries);
+    add_derived_fields(&data, &mut entries, &translations);
     Ok(GuideDataset {
         entries,
         language: actual_language,
@@ -433,7 +435,175 @@ fn object_to_result(
         name,
         description,
         fields,
+        raw_json: serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap_or_default(),
     })
+}
+
+fn add_derived_fields(
+    data: &Value,
+    entries: &mut [GuideSearchResult],
+    translations: &HashMap<String, String>,
+) {
+    let mut index = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        index.insert(entry.id.clone(), idx);
+    }
+
+    let mut objects = Vec::new();
+    collect_objects(data, &mut objects);
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        match kind.as_str() {
+            "recipe" => add_recipe_fields(map, entries, &index, translations, false),
+            "uncraft" => add_recipe_fields(map, entries, &index, translations, true),
+            _ => {}
+        }
+    }
+}
+
+fn collect_objects<'a>(value: &'a Value, objects: &mut Vec<&'a Map<String, Value>>) {
+    match value {
+        Value::Object(map) => {
+            objects.push(map);
+            for child in map.values() {
+                collect_objects(child, objects);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_objects(child, objects);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn add_recipe_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+    uncraft: bool,
+) {
+    let Some(result) = map
+        .get("result")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let recipe_name = map
+        .get("id")
+        .and_then(|value| compact_value(value, translations))
+        .unwrap_or_else(|| result.clone());
+    let time = map
+        .get("time")
+        .and_then(|value| compact_value(value, translations))
+        .unwrap_or_default();
+    let components = map
+        .get("components")
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    let tools = map
+        .get("tools")
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    let byproducts = map
+        .get("byproducts")
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+
+    let summary = recipe_summary(&recipe_name, &components, &tools, &byproducts, &time);
+    if let Some(target) = index.get(&result).and_then(|idx| entries.get_mut(*idx)) {
+        target.fields.push((
+            if uncraft {
+                "uncraft_from"
+            } else {
+                "crafted_by"
+            }
+            .to_string(),
+            summary.clone(),
+        ));
+    }
+
+    for component in components
+        .iter()
+        .filter(|component| index.contains_key(*component))
+    {
+        if let Some(target) = index.get(component).and_then(|idx| entries.get_mut(*idx)) {
+            target.fields.push((
+                if uncraft {
+                    "uncraft_uses"
+                } else {
+                    "used_by_recipe"
+                }
+                .to_string(),
+                format!("{recipe_name} -> {result}"),
+            ));
+        }
+    }
+}
+
+fn recipe_summary(
+    recipe_name: &str,
+    components: &[String],
+    tools: &[String],
+    byproducts: &[String],
+    time: &str,
+) -> String {
+    let mut parts = vec![recipe_name.to_string()];
+    if !components.is_empty() {
+        parts.push(format!("components: {}", components.join(", ")));
+    }
+    if !tools.is_empty() {
+        parts.push(format!("tools: {}", tools.join(", ")));
+    }
+    if !byproducts.is_empty() {
+        parts.push(format!("byproducts: {}", byproducts.join(", ")));
+    }
+    if !time.is_empty() {
+        parts.push(format!("time: {time}"));
+    }
+    parts.join("; ")
+}
+
+fn extract_string_tokens(value: &Value) -> Vec<String> {
+    let mut tokens = Vec::new();
+    collect_string_tokens(value, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn collect_string_tokens(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if looks_like_item_id(text) {
+                tokens.push(text.clone());
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_string_tokens(child, tokens);
+            }
+        }
+        Value::Object(map) => {
+            for child in map.values() {
+                collect_string_tokens(child, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_item_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
 }
 
 fn field_text(
@@ -554,6 +724,52 @@ mod tests {
         assert_eq!(
             resolve_build(&root, "0.I", "experimental").expect("0.I build"),
             "cdda-0.I-2026-03-05-0143"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_adds_recipe_relationships_and_raw_json() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-derived-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"GENERIC","id":"stick_long","name":"long stick"},
+                {"type":"recipe","result":"long_pole","components":[[["stick_long",1]]],"time":"10 m"}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = search_dataset(&dataset, "long_pole", 10)
+            .into_iter()
+            .find(|item| item.id == "long_pole")
+            .expect("long pole");
+        assert!(pole.raw_json.contains("long_pole"));
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "crafted_by" && value.contains("stick_long") && value.contains("10 m")
+        }));
+
+        let stick = search_dataset(&dataset, "used_by_recipe", 10)
+            .into_iter()
+            .find(|item| item.id == "stick_long")
+            .expect("stick");
+        assert!(
+            stick
+                .fields
+                .iter()
+                .any(|(key, value)| key == "used_by_recipe" && value.contains("long_pole"))
         );
 
         let _ = fs::remove_dir_all(root);
