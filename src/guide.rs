@@ -609,8 +609,8 @@ fn object_to_result(
     map: &Map<String, Value>,
     translations: &HashMap<String, String>,
 ) -> Option<GuideSearchResult> {
-    let id = field_text(map, "id", translations)?;
     let kind = field_text(map, "type", translations).unwrap_or_else(|| "entry".to_string());
+    let id = object_identity_id(map, &kind, translations)?;
     let name = field_text(map, "name", translations).unwrap_or_else(|| id.clone());
     let description = field_text(map, "description", translations).unwrap_or_default();
     let mut fields = Vec::new();
@@ -707,6 +707,20 @@ fn object_to_result(
         description,
         fields,
         raw_json: serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap_or_default(),
+    })
+}
+
+fn object_identity_id(
+    map: &Map<String, Value>,
+    kind: &str,
+    translations: &HashMap<String, String>,
+) -> Option<String> {
+    field_text(map, "id", translations).or_else(|| match kind {
+        "recipe" | "uncraft" => {
+            field_text(map, "result", translations).map(|result| format!("{kind}/{result}"))
+        }
+        "monstergroup" => field_text(map, "name", translations),
+        _ => None,
     })
 }
 
@@ -935,10 +949,8 @@ fn add_recipe_fields(
     else {
         return;
     };
-    let recipe_name = map
-        .get("id")
-        .and_then(|value| compact_value(value, translations))
-        .unwrap_or_else(|| result.clone());
+    let kind = if uncraft { "uncraft" } else { "recipe" };
+    let recipe_name = object_identity_id(map, kind, translations).unwrap_or_else(|| result.clone());
     let time = map
         .get("time")
         .and_then(|value| compact_value(value, translations))
@@ -1309,8 +1321,20 @@ mod tests {
             .expect("long pole");
         assert!(pole.raw_json.contains("long_pole"));
         assert!(pole.fields.iter().any(|(key, value)| {
-            key == "crafted_by" && value.contains("stick_long") && value.contains("10 m")
+            key == "crafted_by"
+                && value.contains("recipe/long_pole")
+                && value.contains("stick_long")
+                && value.contains("10 m")
         }));
+        assert_eq!(
+            dataset.get("recipe/long_pole").expect("recipe entry").kind,
+            "recipe"
+        );
+        assert!(
+            relation_target_ids(&pole)
+                .iter()
+                .any(|target| target == "recipe/long_pole")
+        );
 
         let stick = search_dataset(&dataset, "used_by_recipe", 10)
             .into_iter()
