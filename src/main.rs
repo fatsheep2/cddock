@@ -144,6 +144,7 @@ struct GuideSearch {
     index: usize,
     scroll_top: usize,
     detail: Option<guide::GuideSearchResult>,
+    detail_scroll: u16,
 }
 
 #[derive(Debug)]
@@ -557,6 +558,7 @@ impl App {
                 {
                     if let Some(search) = self.guide_search.as_mut() {
                         search.detail = None;
+                        search.detail_scroll = 0;
                     }
                 } else {
                     self.guide_search = None;
@@ -808,6 +810,7 @@ impl App {
                     index: 0,
                     scroll_top: 0,
                     detail: None,
+                    detail_scroll: 0,
                 });
                 self.focus = Focus::Actions;
                 self.message = self
@@ -834,6 +837,7 @@ impl App {
         if let Some(mut result) = search.results.get(search.index).cloned() {
             guide::add_local_tile_info(&game_root, &active_build, &mut result);
             search.detail = Some(result);
+            search.detail_scroll = 0;
             return;
         }
 
@@ -870,6 +874,7 @@ impl App {
             search.results = results;
             search.index = 0;
             search.scroll_top = 0;
+            search.detail_scroll = 0;
         }
         let dataset_status = self
             .guide_dataset
@@ -894,7 +899,11 @@ impl App {
         let Some(search) = self.guide_search.as_mut() else {
             return;
         };
-        if search.detail.is_some() || search.results.is_empty() {
+        if search.detail.is_some() {
+            search.detail_scroll = search.detail_scroll.saturating_sub(1);
+            return;
+        }
+        if search.results.is_empty() {
             return;
         }
         search.index = search
@@ -910,7 +919,11 @@ impl App {
         let Some(search) = self.guide_search.as_mut() else {
             return;
         };
-        if search.detail.is_some() || search.results.is_empty() {
+        if search.detail.is_some() {
+            search.detail_scroll = search.detail_scroll.saturating_add(1);
+            return;
+        }
+        if search.results.is_empty() {
             return;
         }
         search.index = (search.index + 1) % search.results.len();
@@ -1907,7 +1920,7 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
     frame.render_widget(header, chunks[0]);
 
     if let Some(detail) = &search.detail {
-        draw_guide_detail(frame, chunks[1], detail, language);
+        draw_guide_detail(frame, chunks[1], detail, search.detail_scroll, language);
     } else {
         draw_guide_results(frame, chunks[1], search, language);
     }
@@ -1972,6 +1985,7 @@ fn draw_guide_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     detail: &guide::GuideSearchResult,
+    scroll: u16,
     language: Language,
 ) {
     let mut lines = vec![
@@ -2017,6 +2031,7 @@ fn draw_guide_detail(
                 .title(format!(" {} ", language.text("Guide Detail", "图鉴详情")))
                 .borders(Borders::ALL),
         )
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
