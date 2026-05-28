@@ -8,6 +8,7 @@ mod launch;
 mod nav;
 mod paths;
 mod platform;
+mod platform_actions;
 
 use std::{
     io,
@@ -1249,6 +1250,16 @@ impl App {
                     }
                 ))
             }
+            Some(Action::ShowSteamShortcutHelp) => {
+                let binary = std::env::current_exe()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| String::from("cddock"));
+                platform_actions::steam_shortcut_report(
+                    &binary,
+                    &self.config.steam_shortcut_name,
+                    self.config.use_steam_deck_konsole,
+                )
+            }
             Some(Action::SelectStableChannel) => {
                 self.config.release_channel = String::from("stable");
                 let _ = self.config.save(&self.config_path);
@@ -1261,6 +1272,7 @@ impl App {
                 self.open_release_picker("experimental");
                 return;
             }
+            Some(Action::CheckNativeDeps) => platform_actions::native_dependency_report(),
             Some(Action::SelectExistingBuild) => {
                 self.open_installed_picker();
                 return;

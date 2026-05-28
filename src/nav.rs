@@ -130,6 +130,7 @@ pub enum Action {
     InstallGame,
     SelectStableChannel,
     SelectExperimentalChannel,
+    CheckNativeDeps,
     BackToBuilds,
     SelectExistingBuild,
     BackupSaves,
@@ -142,6 +143,7 @@ pub enum Action {
     ShowConfigPath,
     EditSteamShortcutName,
     ToggleSteamDeckKonsole,
+    ShowSteamShortcutHelp,
     Controls,
     BackToHome,
     QuitCddock,
@@ -156,6 +158,7 @@ impl Action {
             Self::SelectExperimentalChannel => {
                 language.text("Fetch experimental list", "获取实验版列表")
             }
+            Self::CheckNativeDeps => language.text("Check native deps", "检查原生依赖"),
             Self::BackToBuilds => language.text("Back to versions", "返回版本页"),
             Self::SelectExistingBuild => language.text("Switch build", "切换版本"),
             Self::BackupSaves => language.text("Backup saves", "备份存档"),
@@ -171,6 +174,9 @@ impl Action {
             }
             Self::ToggleSteamDeckKonsole => {
                 language.text("Toggle Konsole shortcut", "切换 Konsole 快捷方式")
+            }
+            Self::ShowSteamShortcutHelp => {
+                language.text("Show Steam shortcut help", "显示 Steam 快捷方式帮助")
             }
             Self::Controls => language.text("Controls", "控制"),
             Self::BackToHome => language.text("Back to Home", "返回首页"),
@@ -188,10 +194,12 @@ impl Action {
             | Self::ShowConfigPath
             | Self::EditSteamShortcutName
             | Self::ToggleSteamDeckKonsole
+            | Self::ShowSteamShortcutHelp
             | Self::Controls => "SET",
-            Self::InstallGame | Self::SelectStableChannel | Self::SelectExperimentalChannel => {
-                "GET"
-            }
+            Self::InstallGame
+            | Self::SelectStableChannel
+            | Self::SelectExperimentalChannel
+            | Self::CheckNativeDeps => "GET",
             Self::BackToBuilds | Self::BackToHome => "NAV",
             Self::SelectExistingBuild | Self::ShowActiveBuild => "USE",
             Self::BackupSaves => "BAK",
@@ -216,6 +224,7 @@ pub fn page_actions(page: Page) -> &'static [Action] {
         Page::Install => &[
             Action::SelectStableChannel,
             Action::SelectExperimentalChannel,
+            Action::CheckNativeDeps,
             Action::BackToBuilds,
         ],
         Page::Guide => &[
@@ -229,6 +238,7 @@ pub fn page_actions(page: Page) -> &'static [Action] {
             Action::EditCddaPath,
             Action::EditSteamShortcutName,
             Action::ToggleSteamDeckKonsole,
+            Action::ShowSteamShortcutHelp,
             Action::ShowConfigPath,
             Action::Controls,
         ],
@@ -247,5 +257,6 @@ mod tests {
         assert!(actions.contains(&Action::EditCddaPath));
         assert!(actions.contains(&Action::EditSteamShortcutName));
         assert!(actions.contains(&Action::ToggleSteamDeckKonsole));
+        assert!(actions.contains(&Action::ShowSteamShortcutHelp));
     }
 }

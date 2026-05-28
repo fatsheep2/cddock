@@ -166,11 +166,10 @@ Implemented in the TUI:
 - zip backups of the shared `save/` directory from the Versions page
 - GitHub asset matching and stable-tag discovery inspired by catman
 
-Still placeholders:
+Still handled outside the TUI:
 
-- SDL2 dependency detection and repair from the TUI
-- Steam shortcut writing
-- settings path editing inside the TUI
+- SDL2 dependency repair/install remains installer-script driven after TUI detection
+- Steam shortcut writing remains installer-script driven after TUI command/status guidance
 
 The intended layout is:
 

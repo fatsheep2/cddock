@@ -27,10 +27,9 @@ It also has the first language and config layer:
 - config also stores CDDA path, release channel, Steam shortcut name, and whether
   to use a Konsole-backed Steam Deck game-mode entry
 
-Most functional actions are still placeholders. The next implementation layer
-should replace TODO actions with real platform detection, dependency checks,
-CDDA release download/install, save backup, Steam shortcut writing, and launch
-commands.
+Most core management actions now have a first implementation. The remaining
+platform layer should deepen repair flows and Steam shortcut writing beyond the
+current TUI checks/guidance and installer-script support.
 
 ## Core TUI Pages
 
