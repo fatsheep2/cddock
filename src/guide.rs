@@ -162,27 +162,57 @@ pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<
         return Vec::new();
     }
     let query = query.to_lowercase();
-    dataset
+    let mut matches = dataset
         .entries
         .iter()
-        .filter(|result| {
-            let fields = result
-                .fields
-                .iter()
-                .map(|(key, value)| format!("{key}: {value}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "{}\n{}\n{}\n{}",
-                result.id, result.kind, result.name, result.description
-            )
-            .to_lowercase()
-            .contains(&query)
-                || fields.to_lowercase().contains(&query)
+        .enumerate()
+        .filter_map(|(index, result)| {
+            search_score(result, &query).map(|score| (score, index, result))
         })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(score, index, _)| (*score, *index));
+    matches
+        .into_iter()
         .take(limit)
-        .cloned()
+        .map(|(_, _, result)| result.clone())
         .collect()
+}
+
+fn search_score(result: &GuideSearchResult, query: &str) -> Option<usize> {
+    let id = result.id.to_lowercase();
+    let kind = result.kind.to_lowercase();
+    let name = result.name.to_lowercase();
+    let description = result.description.to_lowercase();
+    if id == query {
+        return Some(0);
+    }
+    if id.starts_with(query) {
+        return Some(10);
+    }
+    if name == query {
+        return Some(20);
+    }
+    if name.starts_with(query) {
+        return Some(30);
+    }
+    if id.contains(query) {
+        return Some(40);
+    }
+    if name.contains(query) {
+        return Some(50);
+    }
+    if kind.contains(query) {
+        return Some(60);
+    }
+    if description.contains(query) {
+        return Some(70);
+    }
+    if result.fields.iter().any(|(key, value)| {
+        key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+    }) {
+        return Some(80);
+    }
+    None
 }
 
 pub fn relation_target_ids(result: &GuideSearchResult) -> Vec<String> {
@@ -1263,6 +1293,38 @@ mod tests {
         assert_eq!(search_dataset(&dataset, "pocket_data", 10).len(), 1);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_dataset_ranks_exact_ids_before_field_matches() {
+        let dataset = GuideDataset {
+            entries: vec![
+                GuideSearchResult {
+                    id: "stick_long".to_string(),
+                    kind: "GENERIC".to_string(),
+                    name: "long stick".to_string(),
+                    description: String::new(),
+                    fields: vec![("used_by_recipe".to_string(), "long_pole".to_string())],
+                    raw_json: String::new(),
+                },
+                GuideSearchResult {
+                    id: "long_pole".to_string(),
+                    kind: "GENERIC".to_string(),
+                    name: "long pole".to_string(),
+                    description: String::new(),
+                    fields: Vec::new(),
+                    raw_json: String::new(),
+                },
+            ],
+            language: "en".to_string(),
+            warning: None,
+        };
+
+        let results = search_dataset(&dataset, "long_pole", 10);
+        assert_eq!(
+            results.first().map(|result| result.id.as_str()),
+            Some("long_pole")
+        );
     }
 
     #[test]
