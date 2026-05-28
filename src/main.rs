@@ -2169,23 +2169,32 @@ fn draw_guide_detail(
         lines.extend(render_image_preview_lines(&path, 18, 8));
     }
     push_detail_links(&mut lines, links, link_index);
+    push_field_group(&mut lines, "BASIC", detail, BASIC_GUIDE_FIELDS, Color::Cyan);
+    push_field_group(&mut lines, "USE", detail, USE_GUIDE_FIELDS, Color::Blue);
     push_field_group(
         &mut lines,
-        "REL",
+        "COMBAT",
         detail,
-        &[
-            "crafted_by",
-            "used_by_recipe",
-            "uncraft_from",
-            "uncraft_uses",
-            "found_in_group",
-            "monster_source",
-            "monster_group",
-            "referenced_by",
-        ],
+        COMBAT_GUIDE_FIELDS,
+        Color::Red,
+    );
+    push_field_group(&mut lines, "FOOD", detail, FOOD_GUIDE_FIELDS, Color::Yellow);
+    push_field_group(&mut lines, "MON", detail, MONSTER_GUIDE_FIELDS, Color::Red);
+    push_field_group(
+        &mut lines,
+        "CRAFT",
+        detail,
+        CRAFT_GUIDE_FIELDS,
         Color::Green,
     );
-    push_field_group(&mut lines, "TILE", detail, &["tile_match"], Color::Magenta);
+    push_field_group(&mut lines, "REL", detail, REL_GUIDE_FIELDS, Color::Green);
+    push_field_group(
+        &mut lines,
+        "TILE",
+        detail,
+        TILE_GUIDE_FIELDS,
+        Color::Magenta,
+    );
     push_remaining_fields(&mut lines, detail);
     if !detail.raw_json.is_empty() {
         let mut raw = detail.raw_json.clone();
@@ -2207,6 +2216,105 @@ fn draw_guide_detail(
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
+
+const BASIC_GUIDE_FIELDS: &[&str] = &[
+    "abstract",
+    "copy-from",
+    "looks_like",
+    "category",
+    "subcategory",
+    "symbol",
+    "color",
+    "volume",
+    "weight",
+    "longest_side",
+    "price",
+    "price_postapoc",
+    "count",
+    "charges",
+    "stack_size",
+    "material",
+    "flags",
+];
+const USE_GUIDE_FIELDS: &[&str] = &[
+    "use_action",
+    "ammo",
+    "ammo_effects",
+    "magazine_well",
+    "pocket_data",
+    "container_data",
+    "qualities",
+    "techniques",
+];
+const COMBAT_GUIDE_FIELDS: &[&str] = &[
+    "range",
+    "dispersion",
+    "recoil",
+    "damage",
+    "to_hit",
+    "bashing",
+    "cutting",
+    "armor_bash",
+    "armor_cut",
+    "armor_bullet",
+    "armor_acid",
+    "armor_fire",
+];
+const FOOD_GUIDE_FIELDS: &[&str] = &[
+    "calories",
+    "quench",
+    "healthy",
+    "vitamins",
+    "comestible_type",
+    "fun",
+    "addiction_type",
+    "spoils_in",
+];
+const MONSTER_GUIDE_FIELDS: &[&str] = &[
+    "hp",
+    "speed",
+    "aggression",
+    "morale",
+    "melee_skill",
+    "melee_dice",
+    "melee_dice_sides",
+    "species",
+    "biosignature",
+    "harvest",
+    "death_function",
+];
+const CRAFT_GUIDE_FIELDS: &[&str] = &[
+    "difficulty",
+    "skills",
+    "proficiencies",
+    "components",
+    "result",
+    "byproducts",
+    "tools",
+    "using",
+    "time",
+];
+const REL_GUIDE_FIELDS: &[&str] = &[
+    "crafted_by",
+    "used_by_recipe",
+    "uncraft_from",
+    "uncraft_uses",
+    "found_in_group",
+    "monster_source",
+    "monster_group",
+    "referenced_by",
+];
+const TILE_GUIDE_FIELDS: &[&str] = &[
+    "tile_match",
+    "tiles",
+    "tileset",
+    "fg",
+    "bg",
+    "sprite",
+    "multitile",
+    "additional_tiles",
+    "fallback",
+];
 
 fn push_field_group(
     lines: &mut Vec<Line<'static>>,
@@ -2242,22 +2350,26 @@ fn push_detail_links(lines: &mut Vec<Line<'static>>, links: &[String], link_inde
 }
 
 fn push_remaining_fields(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSearchResult) {
-    const SPECIAL: &[&str] = &[
-        "crafted_by",
-        "used_by_recipe",
-        "uncraft_from",
-        "uncraft_uses",
-        "found_in_group",
-        "monster_source",
-        "monster_group",
-        "referenced_by",
-        "tile_match",
-    ];
     for (key, value) in &detail.fields {
-        if !SPECIAL.iter().any(|candidate| candidate == key) {
+        if !is_grouped_guide_field(key) {
             lines.push(kv_line("DATA", format!("{key}: {value}"), Color::Gray));
         }
     }
+}
+
+fn is_grouped_guide_field(key: &str) -> bool {
+    [
+        BASIC_GUIDE_FIELDS,
+        USE_GUIDE_FIELDS,
+        COMBAT_GUIDE_FIELDS,
+        FOOD_GUIDE_FIELDS,
+        MONSTER_GUIDE_FIELDS,
+        CRAFT_GUIDE_FIELDS,
+        REL_GUIDE_FIELDS,
+        TILE_GUIDE_FIELDS,
+    ]
+    .iter()
+    .any(|group| group.iter().any(|candidate| candidate == &key))
 }
 
 fn guide_preview_paths(detail: &guide::GuideSearchResult) -> Vec<PathBuf> {
