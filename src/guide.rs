@@ -688,10 +688,79 @@ fn resolve_copy_from(
         .and_then(|parent_id| object_index.get(&parent_id).copied())
         .map(|parent| resolve_copy_from(parent, object_index, translations, depth + 1))
         .unwrap_or_default();
+    apply_delete_modifier(&mut resolved, map.get("delete"));
+    apply_extend_modifier(&mut resolved, map.get("extend"));
     for (key, value) in map {
         resolved.insert(key.clone(), value.clone());
     }
     resolved
+}
+
+fn apply_delete_modifier(resolved: &mut Map<String, Value>, modifier: Option<&Value>) {
+    let Some(Value::Object(delete)) = modifier else {
+        return;
+    };
+    for (key, value) in delete {
+        if let Some(target) = resolved.get_mut(key) {
+            delete_value(target, value);
+        }
+    }
+}
+
+fn delete_value(target: &mut Value, delete: &Value) {
+    match target {
+        Value::Array(values) => {
+            values.retain(|value| !modifier_contains_value(delete, value));
+        }
+        Value::Object(map) => {
+            if let Value::Object(delete_map) = delete {
+                for key in delete_map.keys() {
+                    map.remove(key);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn modifier_contains_value(modifier: &Value, candidate: &Value) -> bool {
+    match modifier {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| modifier_contains_value(value, candidate)),
+        other => other == candidate,
+    }
+}
+
+fn apply_extend_modifier(resolved: &mut Map<String, Value>, modifier: Option<&Value>) {
+    let Some(Value::Object(extend)) = modifier else {
+        return;
+    };
+    for (key, value) in extend {
+        match resolved.get_mut(key) {
+            Some(target) => extend_value(target, value),
+            None => {
+                resolved.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn extend_value(target: &mut Value, extend: &Value) {
+    match (target, extend) {
+        (Value::Array(target), Value::Array(values)) => {
+            target.extend(values.iter().cloned());
+        }
+        (Value::Array(target), value) => target.push(value.clone()),
+        (Value::Object(target), Value::Object(values)) => {
+            target.extend(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        (target, value) => *target = value.clone(),
+    }
 }
 
 fn object_to_result(
@@ -1391,7 +1460,9 @@ mod tests {
                     "id":"long_pole",
                     "copy-from":"base_pole",
                     "name":"long pole",
-                    "weight":"900 g"
+                    "weight":"900 g",
+                    "extend":{"flags":["DURABLE"]},
+                    "delete":{"flags":["SPEAR"]}
                 }
             ]"#,
         )
@@ -1419,6 +1490,13 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "copy-from" && value == "base_pole")
         );
+        let flags = pole
+            .fields
+            .iter()
+            .find_map(|(key, value)| (key == "flags").then_some(value))
+            .expect("flags");
+        assert!(flags.contains("DURABLE"));
+        assert!(!flags.contains("SPEAR"));
 
         let _ = fs::remove_dir_all(root);
     }
