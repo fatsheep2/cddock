@@ -146,6 +146,14 @@ impl GuideDataset {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn get(&self, id: &str) -> Option<GuideSearchResult> {
+        self.entries.iter().find(|entry| entry.id == id).cloned()
+    }
+
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
 }
 
 pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<GuideSearchResult> {
@@ -175,6 +183,21 @@ pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<
         .take(limit)
         .cloned()
         .collect()
+}
+
+pub fn relation_target_ids(result: &GuideSearchResult) -> Vec<String> {
+    let mut targets = Vec::new();
+    for (key, value) in &result.fields {
+        if !is_relation_field(key) {
+            continue;
+        }
+        for candidate in extract_relation_ids(value) {
+            if candidate != result.id && !targets.contains(&candidate) {
+                targets.push(candidate);
+            }
+        }
+    }
+    targets
 }
 
 pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut GuideSearchResult) {
@@ -1003,6 +1026,61 @@ fn looks_like_item_id(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
 }
 
+fn is_relation_field(key: &str) -> bool {
+    matches!(
+        key,
+        "crafted_by"
+            | "used_by_recipe"
+            | "uncraft_from"
+            | "uncraft_uses"
+            | "found_in_group"
+            | "monster_source"
+            | "monster_group"
+            | "referenced_by"
+    )
+}
+
+fn extract_relation_ids(value: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for token in value
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/')))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if looks_like_relation_id(token) && !targets.iter().any(|target| target == token) {
+            targets.push(token.to_string());
+        }
+    }
+    targets
+}
+
+fn looks_like_relation_id(value: &str) -> bool {
+    const STOP_WORDS: &[&str] = &[
+        "byproducts",
+        "collection",
+        "components",
+        "death_drops",
+        "distribution",
+        "harvest",
+        "item",
+        "items",
+        "monster",
+        "recipe",
+        "result",
+        "time",
+        "tools",
+        "type",
+        "using",
+        "via",
+    ];
+    looks_like_item_id(value)
+        && value.len() > 1
+        && !value.chars().all(|ch| ch.is_ascii_digit())
+        && !STOP_WORDS
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(value))
+}
+
 fn field_text(
     map: &Map<String, Value>,
     key: &str,
@@ -1287,6 +1365,73 @@ mod tests {
         }));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dataset_get_returns_entries_by_id() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-get-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[{"type":"GENERIC","id":"long_pole","name":"long pole"}]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        assert_eq!(
+            dataset.get("long_pole").expect("long pole").name,
+            "long pole"
+        );
+        assert!(dataset.contains_id("long_pole"));
+        assert!(dataset.get("missing").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relation_target_ids_extracts_navigable_ids() {
+        let result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: vec![
+                (
+                    "referenced_by".to_string(),
+                    "construction:constr_long_pole_rack".to_string(),
+                ),
+                (
+                    "used_by_recipe".to_string(),
+                    "stick_long -> long_pole".to_string(),
+                ),
+                (
+                    "monster_source".to_string(),
+                    "mon_zombie via death_drops".to_string(),
+                ),
+                (
+                    "found_in_group".to_string(),
+                    "tools_common (collection)".to_string(),
+                ),
+            ],
+            raw_json: String::new(),
+        };
+
+        let targets = relation_target_ids(&result);
+        assert!(targets.contains(&"constr_long_pole_rack".to_string()));
+        assert!(targets.contains(&"stick_long".to_string()));
+        assert!(targets.contains(&"mon_zombie".to_string()));
+        assert!(targets.contains(&"tools_common".to_string()));
+        assert!(!targets.contains(&"long_pole".to_string()));
+        assert!(!targets.contains(&"collection".to_string()));
+        assert!(!targets.contains(&"death_drops".to_string()));
     }
 
     #[test]

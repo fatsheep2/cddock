@@ -145,6 +145,9 @@ struct GuideSearch {
     scroll_top: usize,
     detail: Option<guide::GuideSearchResult>,
     detail_scroll: u16,
+    detail_links: Vec<String>,
+    detail_link_index: usize,
+    detail_history: Vec<guide::GuideSearchResult>,
 }
 
 #[derive(Debug)]
@@ -556,10 +559,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|search| search.detail.is_some())
                 {
-                    if let Some(search) = self.guide_search.as_mut() {
-                        search.detail = None;
-                        search.detail_scroll = 0;
-                    }
+                    self.close_guide_detail();
                 } else {
                     self.guide_search = None;
                     self.focus_actions();
@@ -571,11 +571,16 @@ impl App {
                     search.results.clear();
                     search.index = 0;
                     search.scroll_top = 0;
+                    search.detail_links.clear();
+                    search.detail_link_index = 0;
+                    search.detail_history.clear();
                 }
             }
             KeyCode::Char('q') => return true,
             KeyCode::Char('k') | KeyCode::Up => self.guide_move_up(),
             KeyCode::Char('j') | KeyCode::Down => self.guide_move_down(),
+            KeyCode::Tab => self.guide_next_link(),
+            KeyCode::BackTab => self.guide_previous_link(),
             KeyCode::Enter => self.confirm_guide_search(),
             KeyCode::Char(ch) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -586,6 +591,9 @@ impl App {
                         search.results.clear();
                         search.index = 0;
                         search.scroll_top = 0;
+                        search.detail_links.clear();
+                        search.detail_link_index = 0;
+                        search.detail_history.clear();
                     }
                 }
             }
@@ -811,6 +819,9 @@ impl App {
                     scroll_top: 0,
                     detail: None,
                     detail_scroll: 0,
+                    detail_links: Vec::new(),
+                    detail_link_index: 0,
+                    detail_history: Vec::new(),
                 });
                 self.focus = Focus::Actions;
                 self.message = self
@@ -826,24 +837,22 @@ impl App {
     }
 
     fn confirm_guide_search(&mut self) {
-        let game_root = self.game_root();
-        let active_build = self.config.active_build.clone();
-        let Some(search) = self.guide_search.as_mut() else {
+        let Some(search) = self.guide_search.as_ref() else {
             return;
         };
         if search.detail.is_some() {
+            self.open_selected_guide_link();
             return;
         }
-        if let Some(mut result) = search.results.get(search.index).cloned() {
-            guide::add_local_tile_info(&game_root, &active_build, &mut result);
-            search.detail = Some(result);
-            search.detail_scroll = 0;
-            return;
-        }
-
+        let selected = search.results.get(search.index).cloned();
         let query = search.query.clone();
         let build = search.build.clone();
         let language = search.language.clone();
+        if let Some(mut result) = selected {
+            self.set_guide_detail(&mut result, false);
+            return;
+        }
+
         let cache_key_matches =
             self.guide_dataset
                 .as_ref()
@@ -875,6 +884,9 @@ impl App {
             search.index = 0;
             search.scroll_top = 0;
             search.detail_scroll = 0;
+            search.detail_links.clear();
+            search.detail_link_index = 0;
+            search.detail_history.clear();
         }
         let dataset_status = self
             .guide_dataset
@@ -893,6 +905,95 @@ impl App {
             "{}: {count}. {dataset_status}",
             self.language.text("Guide results", "图鉴结果")
         );
+    }
+
+    fn set_guide_detail(&mut self, result: &mut guide::GuideSearchResult, push_history: bool) {
+        guide::add_local_tile_info(&self.game_root(), &self.config.active_build, result);
+        let links = self
+            .guide_dataset
+            .as_ref()
+            .map(|(_, _, dataset)| {
+                guide::relation_target_ids(result)
+                    .into_iter()
+                    .filter(|id| dataset.contains_id(id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let Some(search) = self.guide_search.as_mut() else {
+            return;
+        };
+        if push_history && let Some(current) = search.detail.take() {
+            search.detail_history.push(current);
+        }
+        search.detail = Some(result.clone());
+        search.detail_scroll = 0;
+        search.detail_links = links;
+        search.detail_link_index = 0;
+    }
+
+    fn open_selected_guide_link(&mut self) {
+        let Some(link_id) = self
+            .guide_search
+            .as_ref()
+            .and_then(|search| search.detail_links.get(search.detail_link_index).cloned())
+        else {
+            self.message = self
+                .language
+                .text(
+                    "No guide relation link is available.",
+                    "当前详情没有可跳转关系。",
+                )
+                .to_string();
+            return;
+        };
+        let Some(mut result) = self
+            .guide_dataset
+            .as_ref()
+            .and_then(|(_, _, dataset)| dataset.get(&link_id))
+        else {
+            self.message = format!(
+                "{}: {link_id}",
+                self.language
+                    .text("Guide relation target missing", "图鉴关系目标不存在")
+            );
+            return;
+        };
+        self.set_guide_detail(&mut result, true);
+    }
+
+    fn close_guide_detail(&mut self) {
+        let links = if let Some(search) = self.guide_search.as_mut() {
+            if let Some(previous) = search.detail_history.pop() {
+                let links = self
+                    .guide_dataset
+                    .as_ref()
+                    .map(|(_, _, dataset)| {
+                        guide::relation_target_ids(&previous)
+                            .into_iter()
+                            .filter(|id| dataset.contains_id(id))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                search.detail = Some(previous);
+                search.detail_scroll = 0;
+                Some(links)
+            } else {
+                search.detail = None;
+                search.detail_scroll = 0;
+                search.detail_links.clear();
+                search.detail_link_index = 0;
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(links) = links
+            && let Some(search) = self.guide_search.as_mut()
+        {
+            search.detail_links = links;
+            search.detail_link_index = 0;
+        }
     }
 
     fn guide_move_up(&mut self) {
@@ -931,6 +1032,29 @@ impl App {
         if search.index + 1 >= search.scroll_top + VIEWPORT {
             search.scroll_top = search.index.saturating_sub(VIEWPORT - 1);
         }
+    }
+
+    fn guide_next_link(&mut self) {
+        let Some(search) = self.guide_search.as_mut() else {
+            return;
+        };
+        if search.detail.is_none() || search.detail_links.is_empty() {
+            return;
+        }
+        search.detail_link_index = (search.detail_link_index + 1) % search.detail_links.len();
+    }
+
+    fn guide_previous_link(&mut self) {
+        let Some(search) = self.guide_search.as_mut() else {
+            return;
+        };
+        if search.detail.is_none() || search.detail_links.is_empty() {
+            return;
+        }
+        search.detail_link_index = search
+            .detail_link_index
+            .checked_sub(1)
+            .unwrap_or(search.detail_links.len() - 1);
     }
 
     fn browser_items(&self) -> Option<&[ReleaseOption]> {
@@ -1920,16 +2044,31 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
     frame.render_widget(header, chunks[0]);
 
     if let Some(detail) = &search.detail {
-        draw_guide_detail(frame, chunks[1], detail, search.detail_scroll, language);
+        draw_guide_detail(
+            frame,
+            chunks[1],
+            detail,
+            &search.detail_links,
+            search.detail_link_index,
+            search.detail_scroll,
+            language,
+        );
     } else {
         draw_guide_results(frame, chunks[1], search, language);
     }
 
-    let footer = Paragraph::new(language.text(
-        "type query  Enter search/open  j/k move  Backspace edit  Esc back",
-        "输入关键词  Enter 搜索/打开  j/k 移动  Backspace 删除  Esc 返回",
-    ))
-    .block(Block::default().borders(Borders::ALL));
+    let footer_text = if search.detail.is_some() {
+        language.text(
+            "j/k scroll  Tab link  Enter open link  Esc back",
+            "j/k 滚动  Tab 选择关系  Enter 打开关系  Esc 返回",
+        )
+    } else {
+        language.text(
+            "type query  Enter search/open  j/k move  Backspace edit  Esc back",
+            "输入关键词  Enter 搜索/打开  j/k 移动  Backspace 删除  Esc 返回",
+        )
+    };
+    let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -1985,6 +2124,8 @@ fn draw_guide_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     detail: &guide::GuideSearchResult,
+    links: &[String],
+    link_index: usize,
     scroll: u16,
     language: Language,
 ) {
@@ -2004,6 +2145,7 @@ fn draw_guide_detail(
         ));
         lines.extend(render_image_preview_lines(&path, 18, 8));
     }
+    push_detail_links(&mut lines, links, link_index);
     push_field_group(
         &mut lines,
         "REL",
@@ -2054,6 +2196,25 @@ fn push_field_group(
         if keys.iter().any(|candidate| candidate == key) {
             lines.push(kv_line(label, format!("{key}: {value}"), color));
         }
+    }
+}
+
+fn push_detail_links(lines: &mut Vec<Line<'static>>, links: &[String], link_index: usize) {
+    for (index, link) in links.iter().enumerate() {
+        let selected = index == link_index;
+        let marker = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("[LINK] ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{marker}{link}"), style),
+        ]));
     }
 }
 
