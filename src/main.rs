@@ -928,7 +928,7 @@ impl App {
             .guide_dataset
             .as_ref()
             .map(|(_, _, dataset)| {
-                guide::relation_target_ids(result)
+                guide::field_target_ids(result)
                     .into_iter()
                     .filter(|id| dataset.contains_id(id))
                     .collect::<Vec<_>>()
@@ -984,7 +984,7 @@ impl App {
                     .guide_dataset
                     .as_ref()
                     .map(|(_, _, dataset)| {
-                        guide::relation_target_ids(&previous)
+                        guide::field_target_ids(&previous)
                             .into_iter()
                             .filter(|id| dataset.contains_id(id))
                             .collect::<Vec<_>>()

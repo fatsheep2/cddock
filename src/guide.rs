@@ -218,16 +218,32 @@ fn search_score(result: &GuideSearchResult, query: &str) -> Option<usize> {
 pub fn relation_target_ids(result: &GuideSearchResult) -> Vec<String> {
     let mut targets = Vec::new();
     for (key, value) in &result.fields {
-        if !is_relation_field(key) {
-            continue;
-        }
-        for candidate in extract_relation_ids(value) {
-            if candidate != result.id && !targets.contains(&candidate) {
-                targets.push(candidate);
+        if is_relation_field(key) {
+            for candidate in extract_relation_ids(value) {
+                push_unique_target(&mut targets, &result.id, candidate);
             }
         }
     }
     targets
+}
+
+pub fn field_target_ids(result: &GuideSearchResult) -> Vec<String> {
+    let mut targets = relation_target_ids(result);
+    for (key, value) in &result.fields {
+        if is_tile_field(key) {
+            continue;
+        }
+        for candidate in extract_relation_ids(value) {
+            push_unique_target(&mut targets, &result.id, candidate);
+        }
+    }
+    targets
+}
+
+fn push_unique_target(targets: &mut Vec<String>, current_id: &str, candidate: String) {
+    if candidate != current_id && !targets.contains(&candidate) {
+        targets.push(candidate);
+    }
 }
 
 pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut GuideSearchResult) {
@@ -1112,6 +1128,13 @@ fn is_relation_field(key: &str) -> bool {
     )
 }
 
+fn is_tile_field(key: &str) -> bool {
+    matches!(
+        key,
+        "tile_match" | "tiles" | "tileset" | "fg" | "bg" | "sprite"
+    )
+}
+
 fn extract_relation_ids(value: &str) -> Vec<String> {
     let mut targets = Vec::new();
     for token in value
@@ -1603,6 +1626,34 @@ mod tests {
         assert!(!targets.contains(&"long_pole".to_string()));
         assert!(!targets.contains(&"collection".to_string()));
         assert!(!targets.contains(&"death_drops".to_string()));
+    }
+
+    #[test]
+    fn field_target_ids_includes_generic_data_references() {
+        let result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: vec![
+                ("looks_like".to_string(), "stick_long".to_string()),
+                (
+                    "use_action".to_string(),
+                    "target: fire; item: charcoal".to_string(),
+                ),
+                (
+                    "tile_match".to_string(),
+                    "tileset: TestTiles; fg: 42".to_string(),
+                ),
+            ],
+            raw_json: String::new(),
+        };
+
+        let targets = field_target_ids(&result);
+        assert!(targets.contains(&"stick_long".to_string()));
+        assert!(targets.contains(&"charcoal".to_string()));
+        assert!(!targets.contains(&"long_pole".to_string()));
+        assert!(!targets.contains(&"TestTiles".to_string()));
     }
 
     #[test]
