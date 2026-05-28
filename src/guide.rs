@@ -615,7 +615,7 @@ fn object_to_result(
     let description = field_text(map, "description", translations).unwrap_or_default();
     let mut fields = Vec::new();
 
-    for key in [
+    const PRIMARY_FIELDS: &[&str] = &[
         "abstract",
         "copy-from",
         "looks_like",
@@ -688,12 +688,15 @@ fn object_to_result(
         "fallback",
         "harvest",
         "death_function",
-    ] {
-        if let Some(value) = map
-            .get(key)
-            .and_then(|value| compact_value(value, translations))
-        {
-            fields.push((key.to_string(), value));
+    ];
+    for key in PRIMARY_FIELDS {
+        add_compact_field(&mut fields, map, key, translations);
+    }
+    let mut extra_keys = map.keys().map(String::as_str).collect::<Vec<_>>();
+    extra_keys.sort_unstable();
+    for key in extra_keys {
+        if !is_identity_field(key) && !PRIMARY_FIELDS.contains(&key) {
+            add_compact_field(&mut fields, map, key, translations);
         }
     }
 
@@ -705,6 +708,24 @@ fn object_to_result(
         fields,
         raw_json: serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap_or_default(),
     })
+}
+
+fn is_identity_field(key: &str) -> bool {
+    matches!(key, "id" | "type" | "name" | "description")
+}
+
+fn add_compact_field(
+    fields: &mut Vec<(String, String)>,
+    map: &Map<String, Value>,
+    key: &str,
+    translations: &HashMap<String, String>,
+) {
+    if let Some(value) = map
+        .get(key)
+        .and_then(|value| compact_value(value, translations))
+    {
+        fields.push((key.to_string(), value));
+    }
 }
 
 fn add_derived_fields(
@@ -1173,6 +1194,61 @@ mod tests {
                 .is_some_and(|warning| warning.contains("using English"))
         );
         assert_eq!(search_dataset(&dataset, "HAMMER", 10).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_indexes_unlisted_detail_fields() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-fields-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {
+                    "type":"GENERIC",
+                    "id":"hiking_pack",
+                    "name":"hiking pack",
+                    "pocket_data":[{"pocket_type":"CONTAINER","max_contains_volume":"20 L"}],
+                    "relative":{"weight":"80 g"},
+                    "delete":{"flags":["OLD_FLAG"]},
+                    "extend":{"flags":["NEW_FLAG"]}
+                }
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pack = dataset.get("hiking_pack").expect("pack");
+        assert!(
+            pack.fields
+                .iter()
+                .any(|(key, value)| key == "pocket_data" && value.contains("20 L"))
+        );
+        assert!(
+            pack.fields
+                .iter()
+                .any(|(key, value)| key == "relative" && value.contains("80 g"))
+        );
+        assert!(
+            pack.fields
+                .iter()
+                .any(|(key, value)| key == "delete" && value.contains("OLD_FLAG"))
+        );
+        assert!(
+            pack.fields
+                .iter()
+                .any(|(key, value)| key == "extend" && value.contains("NEW_FLAG"))
+        );
+        assert_eq!(search_dataset(&dataset, "pocket_data", 10).len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
