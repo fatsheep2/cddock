@@ -901,10 +901,25 @@ impl App {
                     + &format!("lang {lang}, indexed {total}")
             })
             .unwrap_or_default();
-        self.message = format!(
-            "{}: {count}. {dataset_status}",
-            self.language.text("Guide results", "图鉴结果")
-        );
+        let empty_hint = if count == 0 {
+            self.language.text(
+                "No matches; try an English item id/name or a field such as flags, material, recipe, tileset.",
+                "没有匹配；可试英文物品 id/名称，或 flags、material、recipe、tileset 等字段。",
+            )
+        } else {
+            ""
+        };
+        self.message = if empty_hint.is_empty() {
+            format!(
+                "{}: {count}. {dataset_status}",
+                self.language.text("Guide results", "图鉴结果")
+            )
+        } else {
+            format!(
+                "{}: {count}. {dataset_status} {empty_hint}",
+                self.language.text("Guide results", "图鉴结果")
+            )
+        };
     }
 
     fn set_guide_detail(&mut self, result: &mut guide::GuideSearchResult, push_history: bool) {
@@ -2074,12 +2089,20 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
 
 fn draw_guide_results(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, language: Language) {
     if search.results.is_empty() {
-        let empty = Paragraph::new(language.text(
+        let mut lines = vec![Line::from(language.text(
             "Type an id/name/field such as zombie, hammer, rifle, recipe, tileset, then press Enter.",
             "输入 id/名称/字段，例如 zombie、hammer、rifle、recipe、tileset，然后按 Enter。",
-        ))
-        .block(Block::default().borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
+        ))];
+        if search.language_note.is_some() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(language.text(
+                "This build is using English guide data, so English ids and names work best.",
+                "这个版本正在使用英文图鉴数据，优先搜索英文 id 和名称。",
+            )));
+        }
+        let empty = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: true });
         frame.render_widget(empty, area);
         return;
     }
