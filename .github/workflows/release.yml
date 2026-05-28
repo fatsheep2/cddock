@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - dev
     tags:
       - "v*"
@@ -50,7 +51,7 @@ jobs:
           fi
           archive="$(scripts/package-release.sh "${{ matrix.target }}" "${version}")"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
-          if [[ "${GITHUB_REF_TYPE:-}" == "branch" && "${GITHUB_REF_NAME:-}" == "dev" ]]; then
+          if [[ "${GITHUB_REF_TYPE:-}" == "branch" && ( "${GITHUB_REF_NAME:-}" == "dev" || "${GITHUB_REF_NAME:-}" == "main" ) ]]; then
             dev_snapshot="dist/cddock-dev-snapshot-${{ matrix.target }}.tar.gz"
             cp "$archive" "$dev_snapshot"
             echo "dev_snapshot=${dev_snapshot}" >> "$GITHUB_OUTPUT"
@@ -77,7 +78,7 @@ jobs:
             ${{ steps.package.outputs.latest }}
 
       - name: Upload dev snapshot release asset
-        if: github.ref_type == 'branch' && github.ref_name == 'dev'
+        if: github.ref_type == 'branch' && (github.ref_name == 'dev' || github.ref_name == 'main')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev-snapshot

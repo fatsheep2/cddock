@@ -218,7 +218,7 @@ release_target() {
 }
 
 install_binary() {
-  local target_dir target_path target version url tmp archive binary tmp_target
+  local target_dir target_path target version url fallback_url tmp archive binary tmp_target
   local script_dir
 
   if [[ "$IS_STEAMOS" -eq 1 ]] && [[ -d /home/deck ]]; then
@@ -231,9 +231,12 @@ install_binary() {
   target_path="${target_dir}/${APP_NAME}"
   target="$(release_target)"
   version="${CDDOCK_VERSION:-latest}"
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_dir=""
+  if [[ "${BASH_SOURCE[0]+set}" == "set" ]] && [[ -n "${BASH_SOURCE[0]}" ]]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fi
 
-  if [[ -x "${script_dir}/cddock" ]]; then
+  if [[ -n "$script_dir" ]] && [[ -x "${script_dir}/cddock" ]]; then
     msg "正在安装本地安装包中的 ${APP_NAME}。" \
       "Installing ${APP_NAME} from the local package."
     tmp_target="$(mktemp "${target_dir}/.${APP_NAME}.XXXXXX")"
@@ -248,15 +251,29 @@ install_binary() {
 
   if [[ "$version" == "latest" ]]; then
     url="https://github.com/${REPO}/releases/latest/download/cddock-latest-${target}.tar.gz"
+    fallback_url="https://github.com/${REPO}/releases/download/dev-snapshot/cddock-dev-snapshot-${target}.tar.gz"
+  elif [[ "$version" == "dev-snapshot" ]]; then
+    url="https://github.com/${REPO}/releases/download/dev-snapshot/cddock-dev-snapshot-${target}.tar.gz"
+    fallback_url=""
   else
     url="https://github.com/${REPO}/releases/download/${version}/cddock-${version}-${target}.tar.gz"
+    fallback_url=""
   fi
 
   tmp="$(mktemp -d)"
   archive="${tmp}/cddock.tar.gz"
   msg "正在下载 ${APP_NAME}：${url}" \
     "Downloading ${APP_NAME}: ${url}"
-  curl -fsSL "$url" -o "$archive"
+  if ! curl -fsSL "$url" -o "$archive"; then
+    if [[ -z "$fallback_url" ]]; then
+      msg "下载失败。请确认该版本已发布当前平台安装包。" \
+        "Download failed. Make sure this version has a release package for the current platform."
+      exit 1
+    fi
+    msg "latest 安装包不可用，改用 dev-snapshot：${fallback_url}" \
+      "The latest package was unavailable; trying dev-snapshot: ${fallback_url}"
+    curl -fsSL "$fallback_url" -o "$archive"
+  fi
   tar -xzf "$archive" -C "$tmp"
   binary="$(find "$tmp" -type f -name cddock | head -n 1)"
   if [[ -z "$binary" ]]; then
