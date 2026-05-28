@@ -24,7 +24,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use image::{GenericImageView, Pixel};
+use image::{GenericImageView, Pixel, imageops::FilterType};
 use std::collections::HashMap;
 
 use install::{DownloadJob, DownloadPhase, ReleaseOption, fetch_release_page, start_download};
@@ -176,6 +176,22 @@ enum Focus {
     Actions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FocusPoint {
+    focus: Focus,
+    index: usize,
+    x: i32,
+    y: i32,
+}
+
 impl Default for App {
     fn default() -> Self {
         let config_path = config_path();
@@ -201,8 +217,8 @@ impl Default for App {
             action_index: 0,
             message: language
                 .text(
-                    "Ready. Tab changes focus. j/k or arrows move in the focused panel.",
-                    "已就绪。Tab 切换焦点，j/k 或方向键在当前面板内移动。",
+                    "Ready. Arrow keys move by screen position; Enter activates.",
+                    "已就绪。方向键按屏幕相对位置移动，Enter 执行。",
                 )
                 .to_string(),
             overlay: None,
@@ -438,10 +454,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Tab | KeyCode::BackTab => self.toggle_focus(),
-            KeyCode::Char('h') | KeyCode::Left => self.focus_pages(),
-            KeyCode::Char('l') | KeyCode::Right => self.focus_actions(),
-            KeyCode::Char('k') | KeyCode::Up => self.previous_item(),
-            KeyCode::Char('j') | KeyCode::Down => self.next_item(),
+            KeyCode::Char('h') | KeyCode::Left => self.move_focus(FocusDirection::Left),
+            KeyCode::Char('l') | KeyCode::Right => self.move_focus(FocusDirection::Right),
+            KeyCode::Char('k') | KeyCode::Up => self.move_focus(FocusDirection::Up),
+            KeyCode::Char('j') | KeyCode::Down => self.move_focus(FocusDirection::Down),
             KeyCode::Esc => {
                 if self.page() == Page::Home {
                     return true;
@@ -1265,33 +1281,54 @@ impl App {
         }
     }
 
-    fn previous_item(&mut self) {
-        match self.focus {
-            Focus::Pages => self.previous_page(),
-            Focus::Actions => self.previous_action(),
+    fn move_focus(&mut self, direction: FocusDirection) {
+        let current = self.current_focus_point();
+        let points = self.focus_points();
+        let Some(next) = spatial_focus_target(current, &points, direction) else {
+            return;
+        };
+        self.apply_focus_point(next);
+    }
+
+    fn current_focus_point(&self) -> FocusPoint {
+        let index = match self.focus {
+            Focus::Pages => self.page_index,
+            Focus::Actions => self.action_index,
+        };
+        focus_point(self.focus, index, self.page(), self.actions().len())
+    }
+
+    fn focus_points(&self) -> Vec<FocusPoint> {
+        let page_points = Page::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, _)| focus_point(Focus::Pages, index, self.page(), self.actions().len()));
+        let action_points = self.actions().iter().enumerate().map(|(index, _)| {
+            focus_point(Focus::Actions, index, self.page(), self.actions().len())
+        });
+        page_points.chain(action_points).collect()
+    }
+
+    fn apply_focus_point(&mut self, point: FocusPoint) {
+        match point.focus {
+            Focus::Pages => {
+                if self.page_index != point.index {
+                    self.page_index = point.index.min(Page::ALL.len().saturating_sub(1));
+                    self.action_index = 0;
+                    self.on_page_changed();
+                }
+                self.focus = Focus::Pages;
+            }
+            Focus::Actions => {
+                let action_count = self.actions().len();
+                if action_count == 0 {
+                    self.action_index = 0;
+                } else {
+                    self.action_index = point.index.min(action_count - 1);
+                }
+                self.focus = Focus::Actions;
+            }
         }
-    }
-
-    fn next_item(&mut self) {
-        match self.focus {
-            Focus::Pages => self.next_page(),
-            Focus::Actions => self.next_action(),
-        }
-    }
-
-    fn previous_page(&mut self) {
-        self.page_index = self
-            .page_index
-            .checked_sub(1)
-            .unwrap_or(Page::ALL.len().saturating_sub(1));
-        self.action_index = 0;
-        self.on_page_changed();
-    }
-
-    fn next_page(&mut self) {
-        self.page_index = (self.page_index + 1) % Page::ALL.len();
-        self.action_index = 0;
-        self.on_page_changed();
     }
 
     fn on_page_changed(&mut self) {
@@ -1303,27 +1340,6 @@ impl App {
             self.language.text("Opened", "已打开"),
             self.page().title(self.language)
         );
-    }
-
-    fn previous_action(&mut self) {
-        let actions = self.actions();
-        if actions.is_empty() {
-            self.action_index = 0;
-            return;
-        }
-        self.action_index = self
-            .action_index
-            .checked_sub(1)
-            .unwrap_or(actions.len().saturating_sub(1));
-    }
-
-    fn next_action(&mut self) {
-        let actions = self.actions();
-        if actions.is_empty() {
-            self.action_index = 0;
-            return;
-        }
-        self.action_index = (self.action_index + 1) % actions.len();
     }
 
     fn toggle_focus(&mut self) {
@@ -1511,6 +1527,78 @@ impl App {
             ),
         }
     }
+}
+
+fn focus_point(focus: Focus, index: usize, page: Page, _action_count: usize) -> FocusPoint {
+    match focus {
+        Focus::Pages => FocusPoint {
+            focus,
+            index,
+            x: 0,
+            y: index as i32,
+        },
+        Focus::Actions if page == Page::Home => FocusPoint {
+            focus,
+            index,
+            x: index as i32 + 1,
+            y: 0,
+        },
+        Focus::Actions => FocusPoint {
+            focus,
+            index,
+            x: 1,
+            y: index as i32,
+        },
+    }
+}
+
+fn spatial_focus_target(
+    current: FocusPoint,
+    points: &[FocusPoint],
+    direction: FocusDirection,
+) -> Option<FocusPoint> {
+    let directional = points
+        .iter()
+        .copied()
+        .filter(|point| *point != current)
+        .filter(|point| match direction {
+            FocusDirection::Up => point.y < current.y,
+            FocusDirection::Down => point.y > current.y,
+            FocusDirection::Left => point.x < current.x,
+            FocusDirection::Right => point.x > current.x,
+        })
+        .collect::<Vec<_>>();
+    if directional.is_empty() {
+        return None;
+    }
+
+    let aligned = directional
+        .iter()
+        .copied()
+        .filter(|point| match direction {
+            FocusDirection::Up | FocusDirection::Down => point.x == current.x,
+            FocusDirection::Left | FocusDirection::Right => point.y == current.y,
+        })
+        .collect::<Vec<_>>();
+    let candidates = if aligned.is_empty() {
+        directional.as_slice()
+    } else {
+        aligned.as_slice()
+    };
+
+    candidates.iter().copied().min_by_key(|point| {
+        let forward = match direction {
+            FocusDirection::Up => current.y - point.y,
+            FocusDirection::Down => point.y - current.y,
+            FocusDirection::Left => current.x - point.x,
+            FocusDirection::Right => point.x - current.x,
+        };
+        let perpendicular = match direction {
+            FocusDirection::Up | FocusDirection::Down => (point.x - current.x).abs(),
+            FocusDirection::Left | FocusDirection::Right => (point.y - current.y).abs(),
+        };
+        (perpendicular, forward)
+    })
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -2162,11 +2250,11 @@ fn draw_guide_detail(
     }
     for path in guide_preview_paths(detail).into_iter().take(3) {
         lines.push(kv_line(
-            "PREVIEW",
-            path.display().to_string(),
+            "SPRITE",
+            sprite_preview_label(&path),
             Color::Magenta,
         ));
-        lines.extend(render_image_preview_lines(&path, 18, 8));
+        lines.extend(render_image_preview_lines(&path, 24, 12));
     }
     push_detail_links(&mut lines, links, link_index);
     push_field_group(&mut lines, "BASIC", detail, BASIC_GUIDE_FIELDS, Color::Cyan);
@@ -2188,13 +2276,7 @@ fn draw_guide_detail(
         Color::Green,
     );
     push_field_group(&mut lines, "REL", detail, REL_GUIDE_FIELDS, Color::Green);
-    push_field_group(
-        &mut lines,
-        "TILE",
-        detail,
-        TILE_GUIDE_FIELDS,
-        Color::Magenta,
-    );
+    push_tile_field_group(&mut lines, detail);
     push_remaining_fields(&mut lines, detail);
     if !detail.raw_json.is_empty() {
         let mut raw = detail.raw_json.clone();
@@ -2330,6 +2412,32 @@ fn push_field_group(
     }
 }
 
+fn push_tile_field_group(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSearchResult) {
+    for (key, value) in &detail.fields {
+        if TILE_GUIDE_FIELDS.iter().any(|candidate| candidate == key) {
+            lines.push(kv_line(
+                "TILE",
+                format!("{key}: {}", tile_display_value(value)),
+                Color::Magenta,
+            ));
+        }
+    }
+}
+
+fn tile_display_value(value: &str) -> String {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| {
+            part.split_once(": ")
+                .map(|(key, _)| !key.ends_with("preview"))
+                .unwrap_or(true)
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn push_detail_links(lines: &mut Vec<Line<'static>>, links: &[String], link_index: usize) {
     for (index, link) in links.iter().enumerate() {
         let selected = index == link_index;
@@ -2375,8 +2483,13 @@ fn is_grouped_guide_field(key: &str) -> bool {
 fn guide_preview_paths(detail: &guide::GuideSearchResult) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for (_, value) in &detail.fields {
-        for segment in value.split("preview: ").skip(1) {
-            let path = segment.split(';').next().unwrap_or_default().trim();
+        for part in value.split(';') {
+            let Some((key, path)) = part.trim().split_once(": ") else {
+                continue;
+            };
+            if !key.ends_with("preview") {
+                continue;
+            }
             if !path.is_empty() {
                 let path = PathBuf::from(path);
                 if !paths.contains(&path) {
@@ -2388,11 +2501,25 @@ fn guide_preview_paths(detail: &guide::GuideSearchResult) -> Vec<PathBuf> {
     paths
 }
 
+fn sprite_preview_label(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("local tile")
+        .to_string()
+}
+
 fn render_image_preview_lines(path: &Path, max_width: u32, max_rows: u32) -> Vec<Line<'static>> {
     let Ok(image) = image::open(path) else {
         return Vec::new();
     };
-    let image = image.thumbnail(max_width, max_rows.saturating_mul(2).max(1));
+    let max_height = max_rows.saturating_mul(2).max(1);
+    let (source_width, source_height) = image.dimensions();
+    let scale = (max_width as f32 / source_width.max(1) as f32)
+        .min(max_height as f32 / source_height.max(1) as f32)
+        .min(1.0);
+    let target_width = ((source_width as f32 * scale).round() as u32).max(1);
+    let target_height = ((source_height as f32 * scale).round() as u32).max(1);
+    let image = image.resize_exact(target_width, target_height, FilterType::Nearest);
     let (width, height) = image.dimensions();
     let mut lines = Vec::new();
     let mut y = 0;
@@ -2400,23 +2527,40 @@ fn render_image_preview_lines(path: &Path, max_width: u32, max_rows: u32) -> Vec
         let mut spans = Vec::new();
         spans.push(Span::styled("[IMG] ", Style::default().fg(Color::Magenta)));
         for x in 0..width {
-            let upper = image.get_pixel(x, y).to_rgb();
+            let upper = image.get_pixel(x, y).to_rgba();
             let lower = if y + 1 < height {
-                image.get_pixel(x, y + 1).to_rgb()
+                image.get_pixel(x, y + 1).to_rgba()
             } else {
-                upper
+                image::Rgba([0, 0, 0, 0])
             };
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(Color::Rgb(upper[0], upper[1], upper[2]))
-                    .bg(Color::Rgb(lower[0], lower[1], lower[2])),
-            ));
+            spans.push(sprite_pixel_span(upper.0, lower.0));
         }
         lines.push(Line::from(spans));
         y += 2;
     }
     lines
+}
+
+fn sprite_pixel_span(upper: [u8; 4], lower: [u8; 4]) -> Span<'static> {
+    let upper_visible = upper[3] > 16;
+    let lower_visible = lower[3] > 16;
+    match (upper_visible, lower_visible) {
+        (true, true) => Span::styled(
+            "▀",
+            Style::default()
+                .fg(Color::Rgb(upper[0], upper[1], upper[2]))
+                .bg(Color::Rgb(lower[0], lower[1], lower[2])),
+        ),
+        (true, false) => Span::styled(
+            "▀",
+            Style::default().fg(Color::Rgb(upper[0], upper[1], upper[2])),
+        ),
+        (false, true) => Span::styled(
+            "▄",
+            Style::default().fg(Color::Rgb(lower[0], lower[1], lower[2])),
+        ),
+        (false, false) => Span::raw(" "),
+    }
 }
 
 fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
@@ -2427,10 +2571,8 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
         Language::English => vec![
             Line::from("Navigation"),
             Line::from("  tab           switch focus between pages and actions"),
-            Line::from("  h / left      focus pages"),
-            Line::from("  l / right     focus actions"),
-            Line::from("  k / up        previous item in focused panel"),
-            Line::from("  j / down      next item in focused panel"),
+            Line::from("  h/j/k/l       move by screen position"),
+            Line::from("  arrows        move by screen position"),
             Line::from("  enter         enter page or activate action"),
             Line::from("  esc           focus pages, then home"),
             Line::from("  q / ctrl-c    quit"),
@@ -2438,7 +2580,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
             Line::from("Steam Deck"),
             Line::from("  Map D-pad or left stick to arrow keys."),
             Line::from("  Map A to Enter, B to Esc, Menu to q if desired."),
-            Line::from("  Map L1/R1 to Tab or h/l for focus switching."),
+            Line::from("  Map L1/R1 to Tab if you still want panel switching."),
             Line::from(""),
             Line::from("Virtual keyboard (Steam + X)"),
             Line::from("  Steam OSK often shows but does not type into raw TUI/Konsole."),
@@ -2449,10 +2591,8 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
         Language::Chinese => vec![
             Line::from("导航"),
             Line::from("  Tab            在页面列表和动作区之间切换焦点"),
-            Line::from("  h / 左方向键    焦点移到页面列表"),
-            Line::from("  l / 右方向键    焦点移到动作区"),
-            Line::from("  k / 上方向键    当前面板上一个项目"),
-            Line::from("  j / 下方向键    当前面板下一个项目"),
+            Line::from("  h/j/k/l        按屏幕相对位置移动"),
+            Line::from("  方向键          按屏幕相对位置移动"),
             Line::from("  Enter          进入页面或执行动作"),
             Line::from("  Esc            先回页面列表，再回首页"),
             Line::from("  q / Ctrl-C     退出"),
@@ -2460,7 +2600,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
             Line::from("Steam Deck"),
             Line::from("  将十字键或左摇杆映射为方向键。"),
             Line::from("  建议 A 映射 Enter，B 映射 Esc，菜单键映射 q。"),
-            Line::from("  建议 L1/R1 映射 Tab 或 h/l，用于切换焦点。"),
+            Line::from("  若仍需要面板切换，可将 L1/R1 映射为 Tab。"),
             Line::from(""),
             Line::from("虚拟键盘 (Steam + X)"),
             Line::from("  Steam 软键盘常会弹出，但无法向 Konsole/raw TUI 输入字符。"),
@@ -2775,5 +2915,76 @@ build_channels = "exp-1=experimental,0.H=stable"
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn guide_preview_paths_reads_fg_and_bg_preview_fields() {
+        let detail = guide::GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: vec![(
+                "tile_match".to_string(),
+                "tileset: Test; fg_preview: /tmp/fg.png; bg_preview: /tmp/bg.png; fg: 42"
+                    .to_string(),
+            )],
+            raw_json: String::new(),
+        };
+
+        let paths = guide_preview_paths(&detail);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/tmp/fg.png"), PathBuf::from("/tmp/bg.png")]
+        );
+    }
+
+    #[test]
+    fn sprite_pixel_span_leaves_transparent_pixels_blank() {
+        let blank = sprite_pixel_span([0, 0, 0, 0], [0, 0, 0, 0]);
+        assert_eq!(blank.content.as_ref(), " ");
+
+        let lower = sprite_pixel_span([0, 0, 0, 0], [255, 0, 0, 255]);
+        assert_eq!(lower.content.as_ref(), "▄");
+    }
+
+    #[test]
+    fn tile_display_value_hides_preview_paths() {
+        let value =
+            "tileset: Test; fg_preview: /tmp/fg.png; fg_crop: 16,16 16x16; bg_preview: /tmp/bg.png";
+
+        let display = tile_display_value(value);
+        assert_eq!(display, "tileset: Test; fg_crop: 16,16 16x16");
+    }
+
+    #[test]
+    fn spatial_focus_moves_right_to_same_row_action() {
+        let points = vec![
+            focus_point(Focus::Pages, 2, Page::Install, 4),
+            focus_point(Focus::Actions, 0, Page::Install, 4),
+            focus_point(Focus::Actions, 1, Page::Install, 4),
+            focus_point(Focus::Actions, 2, Page::Install, 4),
+            focus_point(Focus::Actions, 3, Page::Install, 4),
+        ];
+
+        let next =
+            spatial_focus_target(points[0], &points, FocusDirection::Right).expect("right target");
+        assert_eq!(next.focus, Focus::Actions);
+        assert_eq!(next.index, 2);
+    }
+
+    #[test]
+    fn spatial_focus_moves_horizontally_across_home_actions() {
+        let points = vec![
+            focus_point(Focus::Actions, 0, Page::Home, 3),
+            focus_point(Focus::Actions, 1, Page::Home, 3),
+            focus_point(Focus::Actions, 2, Page::Home, 3),
+        ];
+
+        let next =
+            spatial_focus_target(points[0], &points, FocusDirection::Right).expect("right target");
+        assert_eq!(next.focus, Focus::Actions);
+        assert_eq!(next.index, 1);
+        assert!(spatial_focus_target(points[0], &points, FocusDirection::Down).is_none());
     }
 }

@@ -407,7 +407,7 @@ fn tile_match_summary(
     }
     if let (Some(sheet), Some((tile_width, tile_height))) = (sheet, tile_size) {
         let sheet_path = tileset_dir.join(sheet);
-        if let Some((image_width, _)) = png_dimensions(&sheet_path) {
+        if let Some((image_width, image_height)) = png_dimensions(&sheet_path) {
             let columns = (image_width / tile_width).max(1);
             for key in ["fg", "bg"] {
                 let Some(tile_id) = map.get(key).and_then(first_tile_sprite_index) else {
@@ -416,11 +416,20 @@ fn tile_match_summary(
                 let x = (tile_id % columns) * tile_width;
                 let y = (tile_id / columns) * tile_height;
                 parts.push(format!("{key}_crop: {x},{y} {tile_width}x{tile_height}"));
+                if x.saturating_add(tile_width) > image_width
+                    || y.saturating_add(tile_height) > image_height
+                {
+                    parts.push(format!(
+                        "{key}_preview_error: crop outside {image_width}x{image_height}"
+                    ));
+                    continue;
+                }
                 if let Some(preview) = export_tile_preview(
                     &sheet_path,
                     preview_dir,
                     tileset,
                     sheet,
+                    key,
                     x,
                     y,
                     tile_width,
@@ -448,6 +457,7 @@ fn export_tile_preview(
     preview_dir: &Path,
     tileset: &str,
     sheet: &str,
+    layer: &str,
     x: u32,
     y: u32,
     width: u32,
@@ -457,9 +467,10 @@ fn export_tile_preview(
     let crop = image.crop_imm(x, y, width, height);
     fs::create_dir_all(preview_dir).ok()?;
     let filename = format!(
-        "{}-{}-{}-{}.png",
+        "{}-{}-{}-{}-{}.png",
         safe_file_name(tileset),
         safe_file_name(sheet),
+        safe_file_name(layer),
         x,
         y
     );
@@ -472,7 +483,11 @@ fn tile_config_tile_size(value: &Value) -> Option<(u32, u32)> {
     let tile_info = value.get("tile_info")?.as_array()?.first()?.as_object()?;
     let width = tile_info.get("width")?.as_u64()? as u32;
     let height = tile_info.get("height")?.as_u64()? as u32;
-    Some((width, height))
+    if width == 0 || height == 0 {
+        None
+    } else {
+        Some((width, height))
+    }
 }
 
 fn png_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -690,6 +705,7 @@ fn resolve_copy_from(
         .unwrap_or_default();
     apply_delete_modifier(&mut resolved, map.get("delete"));
     apply_extend_modifier(&mut resolved, map.get("extend"));
+    apply_relative_modifier(&mut resolved, map.get("relative"));
     for (key, value) in map {
         resolved.insert(key.clone(), value.clone());
     }
@@ -760,6 +776,94 @@ fn extend_value(target: &mut Value, extend: &Value) {
             );
         }
         (target, value) => *target = value.clone(),
+    }
+}
+
+fn apply_relative_modifier(resolved: &mut Map<String, Value>, modifier: Option<&Value>) {
+    let Some(Value::Object(relative)) = modifier else {
+        return;
+    };
+    for (key, value) in relative {
+        if let Some(target) = resolved.get_mut(key) {
+            apply_relative_value(target, value);
+        }
+    }
+}
+
+fn apply_relative_value(target: &mut Value, relative: &Value) {
+    match (target, relative) {
+        (Value::Number(target), Value::Number(relative)) => {
+            let Some(sum) = target
+                .as_f64()
+                .zip(relative.as_f64())
+                .and_then(|(target, relative)| serde_json::Number::from_f64(target + relative))
+            else {
+                return;
+            };
+            *target = sum;
+        }
+        (Value::String(target), Value::String(relative)) => {
+            if let Some(updated) = apply_relative_string(target, relative) {
+                *target = updated;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_relative_string(target: &str, relative: &str) -> Option<String> {
+    let (target_value, target_unit) = parse_quantity(target)?;
+    if let Some(percent) = parse_percent(relative) {
+        return Some(format_quantity(
+            target_value * (1.0 + percent / 100.0),
+            target_unit,
+        ));
+    }
+    let (relative_value, relative_unit) = parse_quantity(relative)?;
+    if target_unit != relative_unit {
+        return None;
+    }
+    Some(format_quantity(target_value + relative_value, target_unit))
+}
+
+fn parse_percent(value: &str) -> Option<f64> {
+    value.trim().strip_suffix('%')?.trim().parse::<f64>().ok()
+}
+
+fn parse_quantity(value: &str) -> Option<(f64, &str)> {
+    let value = value.trim();
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        if ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.') {
+            end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let number = value[..end].parse::<f64>().ok()?;
+    Some((number, value[end..].trim()))
+}
+
+fn format_quantity(value: f64, unit: &str) -> String {
+    let number = if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        let mut text = format!("{value:.3}");
+        while text.contains('.') && text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        text
+    };
+    if unit.is_empty() {
+        number
+    } else {
+        format!("{number} {unit}")
     }
 }
 
@@ -1463,6 +1567,13 @@ mod tests {
                     "weight":"900 g",
                     "extend":{"flags":["DURABLE"]},
                     "delete":{"flags":["SPEAR"]}
+                },
+                {
+                    "type":"GENERIC",
+                    "id":"short_pole",
+                    "copy-from":"base_pole",
+                    "name":"short pole",
+                    "relative":{"volume":"-250 ml","weight":"50%"}
                 }
             ]"#,
         )
@@ -1497,6 +1608,20 @@ mod tests {
             .expect("flags");
         assert!(flags.contains("DURABLE"));
         assert!(!flags.contains("SPEAR"));
+
+        let short = dataset.get("short_pole").expect("short pole");
+        assert!(
+            short
+                .fields
+                .iter()
+                .any(|(key, value)| key == "volume" && value == "500 ml")
+        );
+        assert!(
+            short
+                .fields
+                .iter()
+                .any(|(key, value)| key == "weight" && value == "1050 g")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
