@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -181,7 +182,10 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
         return;
     }
     let build_path = build_dir(game_root, active_build);
-    let matches = find_tile_matches(&build_path, &result.id);
+    let preview_dir = guide_cache_dir(game_root)
+        .join("tiles")
+        .join(safe_file_name(&result.id));
+    let matches = find_tile_matches(&build_path, &result.id, &preview_dir);
     if matches.is_empty() {
         result.fields.push((
             "tile_match".to_string(),
@@ -195,7 +199,7 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
     }
 }
 
-fn find_tile_matches(build_path: &Path, id: &str) -> Vec<String> {
+fn find_tile_matches(build_path: &Path, id: &str, preview_dir: &Path) -> Vec<String> {
     let gfx = build_path.join("gfx");
     if !gfx.is_dir() {
         return Vec::new();
@@ -223,7 +227,17 @@ fn find_tile_matches(build_path: &Path, id: &str) -> Vec<String> {
             continue;
         };
         let tileset = entry.file_name().to_string_lossy().into_owned();
-        collect_tile_matches(&value, id, &tileset, None, &mut matches);
+        let tile_size = tile_config_tile_size(&value);
+        collect_tile_matches(
+            &value,
+            id,
+            &tileset,
+            &entry.path(),
+            None,
+            tile_size,
+            preview_dir,
+            &mut matches,
+        );
     }
     matches
 }
@@ -232,7 +246,10 @@ fn collect_tile_matches(
     value: &Value,
     id: &str,
     tileset: &str,
+    tileset_dir: &Path,
     sheet: Option<&str>,
+    tile_size: Option<(u32, u32)>,
+    preview_dir: &Path,
     matches: &mut Vec<String>,
 ) {
     match value {
@@ -242,15 +259,40 @@ fn collect_tile_matches(
                 .get("id")
                 .is_some_and(|value| tile_id_matches(value, id))
             {
-                matches.push(tile_match_summary(map, tileset, current_sheet));
+                matches.push(tile_match_summary(
+                    map,
+                    tileset,
+                    tileset_dir,
+                    current_sheet,
+                    tile_size,
+                    preview_dir,
+                ));
             }
             for child in map.values() {
-                collect_tile_matches(child, id, tileset, current_sheet, matches);
+                collect_tile_matches(
+                    child,
+                    id,
+                    tileset,
+                    tileset_dir,
+                    current_sheet,
+                    tile_size,
+                    preview_dir,
+                    matches,
+                );
             }
         }
         Value::Array(values) => {
             for child in values {
-                collect_tile_matches(child, id, tileset, sheet, matches);
+                collect_tile_matches(
+                    child,
+                    id,
+                    tileset,
+                    tileset_dir,
+                    sheet,
+                    tile_size,
+                    preview_dir,
+                    matches,
+                );
             }
         }
         _ => {}
@@ -265,7 +307,14 @@ fn tile_id_matches(value: &Value, id: &str) -> bool {
     }
 }
 
-fn tile_match_summary(map: &Map<String, Value>, tileset: &str, sheet: Option<&str>) -> String {
+fn tile_match_summary(
+    map: &Map<String, Value>,
+    tileset: &str,
+    tileset_dir: &Path,
+    sheet: Option<&str>,
+    tile_size: Option<(u32, u32)>,
+    preview_dir: &Path,
+) -> String {
     let mut parts = vec![format!("tileset: {tileset}")];
     if let Some(sheet) = sheet {
         parts.push(format!("sheet: {sheet}"));
@@ -278,7 +327,95 @@ fn tile_match_summary(map: &Map<String, Value>, tileset: &str, sheet: Option<&st
             parts.push(format!("{key}: {value}"));
         }
     }
+    if let (Some(sheet), Some((tile_width, tile_height)), Some(tile_id)) = (
+        sheet,
+        tile_size,
+        map.get("fg").and_then(|value| value.as_u64()),
+    ) {
+        let sheet_path = tileset_dir.join(sheet);
+        if let Some((image_width, _)) = png_dimensions(&sheet_path) {
+            let columns = (image_width / tile_width).max(1);
+            let tile_id = tile_id as u32;
+            let x = (tile_id % columns) * tile_width;
+            let y = (tile_id / columns) * tile_height;
+            parts.push(format!("crop: {x},{y} {tile_width}x{tile_height}"));
+            if let Some(preview) = export_tile_preview(
+                &sheet_path,
+                preview_dir,
+                tileset,
+                sheet,
+                x,
+                y,
+                tile_width,
+                tile_height,
+            ) {
+                parts.push(format!("preview: {}", preview.display()));
+            }
+        }
+    }
     parts.join("; ")
+}
+
+fn export_tile_preview(
+    sheet_path: &Path,
+    preview_dir: &Path,
+    tileset: &str,
+    sheet: &str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Option<PathBuf> {
+    let image = image::open(sheet_path).ok()?;
+    let crop = image.crop_imm(x, y, width, height);
+    fs::create_dir_all(preview_dir).ok()?;
+    let filename = format!(
+        "{}-{}-{}-{}.png",
+        safe_file_name(tileset),
+        safe_file_name(sheet),
+        x,
+        y
+    );
+    let destination = preview_dir.join(filename);
+    crop.save(&destination).ok()?;
+    Some(destination)
+}
+
+fn tile_config_tile_size(value: &Value) -> Option<(u32, u32)> {
+    let tile_info = value.get("tile_info")?.as_array()?.first()?.as_object()?;
+    let width = tile_info.get("width")?.as_u64()? as u32;
+    let height = tile_info.get("height")?.as_u64()? as u32;
+    Some((width, height))
+}
+
+fn png_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes([header[16], header[17], header[18], header[19]]);
+    let height = u32::from_be_bytes([header[20], header[21], header[22], header[23]]);
+    Some((width, height))
+}
+
+fn safe_file_name(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "tile".to_string()
+    } else {
+        safe
+    }
 }
 
 fn load_translations_with_fallback(
@@ -893,6 +1030,7 @@ mod tests {
         fs::write(
             tileset.join("tile_config.json"),
             r#"{
+                "tile_info": [{"width": 32, "height": 32}],
                 "tiles-new": [
                     {
                         "file": "items.png",
@@ -904,6 +1042,8 @@ mod tests {
             }"#,
         )
         .expect("tile config");
+        let image = image::RgbaImage::from_pixel(64, 768, image::Rgba([255, 0, 0, 255]));
+        image.save(tileset.join("items.png")).expect("png image");
 
         let mut result = GuideSearchResult {
             id: "long_pole".to_string(),
@@ -920,7 +1060,15 @@ mod tests {
                 && value.contains("TestTiles")
                 && value.contains("items.png")
                 && value.contains("fg: 42")
+                && value.contains("crop: 0,672 32x32")
+                && value.contains("preview:")
         }));
+        assert!(
+            guide_cache_dir(&root)
+                .join("tiles")
+                .join("long_pole")
+                .is_dir()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
