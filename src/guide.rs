@@ -704,7 +704,48 @@ fn add_derived_fields(
         match kind.as_str() {
             "recipe" => add_recipe_fields(map, entries, &index, translations, false),
             "uncraft" => add_recipe_fields(map, entries, &index, translations, true),
+            "item_group" => add_item_group_fields(map, entries, &index, translations),
             _ => {}
+        }
+    }
+}
+
+fn add_item_group_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(group_id) = map
+        .get("id")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let subtype = map
+        .get("subtype")
+        .and_then(|value| compact_value(value, translations))
+        .unwrap_or_default();
+    let items = map
+        .get("items")
+        .or_else(|| map.get("entries"))
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+
+    for item in items.iter().filter(|item| index.contains_key(*item)) {
+        if let Some(target) = index.get(item).and_then(|idx| entries.get_mut(*idx)) {
+            let label = if subtype.is_empty() {
+                group_id.clone()
+            } else {
+                format!("{group_id} ({subtype})")
+            };
+            if !target
+                .fields
+                .iter()
+                .any(|(key, value)| key == "found_in_group" && value == &label)
+            {
+                target.fields.push(("found_in_group".to_string(), label));
+            }
         }
     }
 }
@@ -1015,6 +1056,41 @@ mod tests {
                 .fields
                 .iter()
                 .any(|(key, value)| key == "used_by_recipe" && value.contains("long_pole"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_adds_item_group_relationships() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-group-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"item_group","id":"tools_common","subtype":"collection","items":[["long_pole", 25]]}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = search_dataset(&dataset, "tools_common", 10)
+            .into_iter()
+            .find(|item| item.id == "long_pole")
+            .expect("long pole");
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| { key == "found_in_group" && value.contains("tools_common") })
         );
 
         let _ = fs::remove_dir_all(root);
