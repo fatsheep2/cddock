@@ -12,7 +12,7 @@ mod platform_actions;
 
 use std::{
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -24,6 +24,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use image::{GenericImageView, Pixel};
 use std::collections::HashMap;
 
 use install::{DownloadJob, DownloadPhase, ReleaseOption, fetch_release_page, start_download};
@@ -1981,6 +1982,14 @@ fn draw_guide_detail(
     if !detail.description.is_empty() {
         lines.push(kv_line("DESC", detail.description.clone(), Color::Gray));
     }
+    if let Some(path) = guide_preview_path(detail) {
+        lines.push(kv_line(
+            "PREVIEW",
+            path.display().to_string(),
+            Color::Magenta,
+        ));
+        lines.extend(render_image_preview_lines(&path, 18, 8));
+    }
     lines.push(kv_line(
         "TILE",
         language.text(
@@ -2010,6 +2019,50 @@ fn draw_guide_detail(
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn guide_preview_path(detail: &guide::GuideSearchResult) -> Option<PathBuf> {
+    for (_, value) in &detail.fields {
+        let Some((_, path)) = value.rsplit_once("preview: ") else {
+            continue;
+        };
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn render_image_preview_lines(path: &Path, max_width: u32, max_rows: u32) -> Vec<Line<'static>> {
+    let Ok(image) = image::open(path) else {
+        return Vec::new();
+    };
+    let image = image.thumbnail(max_width, max_rows.saturating_mul(2).max(1));
+    let (width, height) = image.dimensions();
+    let mut lines = Vec::new();
+    let mut y = 0;
+    while y < height {
+        let mut spans = Vec::new();
+        spans.push(Span::styled("[IMG] ", Style::default().fg(Color::Magenta)));
+        for x in 0..width {
+            let upper = image.get_pixel(x, y).to_rgb();
+            let lower = if y + 1 < height {
+                image.get_pixel(x, y + 1).to_rgb()
+            } else {
+                upper
+            };
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(upper[0], upper[1], upper[2]))
+                    .bg(Color::Rgb(lower[0], lower[1], lower[2])),
+            ));
+        }
+        lines.push(Line::from(spans));
+        y += 2;
+    }
+    lines
 }
 
 fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
