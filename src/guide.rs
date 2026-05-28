@@ -696,7 +696,7 @@ fn add_derived_fields(
 
     let mut objects = Vec::new();
     collect_objects(data, &mut objects);
-    for map in objects {
+    for map in &objects {
         let kind = map
             .get("type")
             .and_then(|value| compact_value(value, translations))
@@ -708,6 +708,56 @@ fn add_derived_fields(
             "MONSTER" => add_monster_fields(map, entries, &index, translations),
             "monstergroup" => add_monster_group_fields(map, entries, &index, translations),
             _ => {}
+        }
+    }
+    add_cross_reference_fields(&objects, entries, &index, translations);
+}
+
+fn add_cross_reference_fields(
+    objects: &[&Map<String, Value>],
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let mut seen = HashSet::new();
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        if matches!(
+            kind.as_str(),
+            "recipe" | "uncraft" | "item_group" | "MONSTER" | "monstergroup"
+        ) {
+            continue;
+        }
+        let Some(source_id) = map
+            .get("id")
+            .or_else(|| map.get("name"))
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        let source_label = if kind.is_empty() {
+            source_id.clone()
+        } else {
+            format!("{kind}:{source_id}")
+        };
+        for token in extract_string_tokens(&Value::Object((*map).clone())) {
+            if token == source_id {
+                continue;
+            }
+            let Some(target_index) = index.get(&token).copied() else {
+                continue;
+            };
+            if !seen.insert((token.clone(), source_label.clone())) {
+                continue;
+            }
+            if let Some(target) = entries.get_mut(target_index) {
+                target
+                    .fields
+                    .push(("referenced_by".to_string(), source_label.clone()));
+            }
         }
     }
 }
@@ -1202,6 +1252,39 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "monster_group" && value == "GROUP_ZOMBIE")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_adds_generic_reverse_references() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-ref-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"construction","id":"constr_long_pole_rack","using":[["long_pole", 1]]}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = search_dataset(&dataset, "constr_long_pole_rack", 10)
+            .into_iter()
+            .find(|item| item.id == "long_pole")
+            .expect("long pole");
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "referenced_by" && value.contains("construction:constr_long_pole_rack")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

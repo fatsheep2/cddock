@@ -2016,6 +2016,7 @@ fn draw_guide_detail(
             "found_in_group",
             "monster_source",
             "monster_group",
+            "referenced_by",
         ],
         Color::Green,
     );
@@ -2065,6 +2066,7 @@ fn push_remaining_fields(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSe
         "found_in_group",
         "monster_source",
         "monster_group",
+        "referenced_by",
         "tile_match",
     ];
     for (key, value) in &detail.fields {
