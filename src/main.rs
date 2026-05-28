@@ -2,6 +2,7 @@ mod backup;
 mod builds;
 mod config;
 mod guide;
+mod http;
 mod install;
 mod launch;
 mod paths;

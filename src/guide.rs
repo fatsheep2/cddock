@@ -4,13 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::paths::guide_cache_dir;
+use crate::{http, paths::guide_cache_dir};
 
-const USER_AGENT: &str = "cddock/0.1.0";
 const BUILDS_URL: &str = "https://raw.githubusercontent.com/nornagon/cdda-data/main/builds.json";
 const DATA_BASE_URL: &str = "https://raw.githubusercontent.com/nornagon/cdda-data/main/data";
 
@@ -159,10 +157,7 @@ fn fetch_cached(url: &str, cache_path: &Path) -> Result<String, String> {
             .map_err(|error| format!("Failed to read cache {}: {error}", cache_path.display()));
     }
 
-    let client = Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|error| format!("Failed to create guide HTTP client: {error}"))?;
+    let client = http::client("guide")?;
     let response = client
         .get(url)
         .send()

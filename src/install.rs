@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -11,13 +10,13 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use tar::Archive;
 use zip::ZipArchive;
 
 use crate::{
     builds::find_executable,
+    http::github_client,
     paths::{
         build_dir, downloads_dir, ensure_layout, promote_userdata_from_build, userdata_dir,
         versions_dir,
@@ -28,7 +27,6 @@ use crate::{
 const CDDA_REPO: &str = "CleverRaven/Cataclysm-DDA";
 const CDDA_RELEASES_API: &str = "https://api.github.com/repos/CleverRaven/Cataclysm-DDA/releases";
 pub const RELEASES_PER_PAGE: u32 = 50;
-const USER_AGENT: &str = "cddock/0.1.0";
 
 #[derive(Debug, Clone)]
 pub struct ReleasePage {
@@ -168,7 +166,7 @@ pub fn fetch_experimental_page(page: u32) -> Result<ReleasePage, String> {
 }
 
 fn fetch_stable_release_options() -> Result<Vec<ReleaseOption>, String> {
-    let client = http_client()?;
+    let client = github_client()?;
     let url = format!("https://api.github.com/repos/{CDDA_REPO}/git/matching-refs/tags/0.");
     let response = client
         .get(&url)
@@ -245,7 +243,7 @@ fn fetch_stable_from_release_list() -> Result<Vec<ReleaseOption>, String> {
 }
 
 fn fetch_releases_page(page: u32, per_page: u32) -> Result<Vec<GhRelease>, String> {
-    let client = http_client()?;
+    let client = github_client()?;
     let response = client
         .get(CDDA_RELEASES_API)
         .query(&[
@@ -267,7 +265,10 @@ fn fetch_releases_page(page: u32, per_page: u32) -> Result<Vec<GhRelease>, Strin
         .map_err(|error| format!("Failed to parse GitHub releases: {error}"))
 }
 
-fn fetch_release_by_tag(client: &Client, tag: &str) -> Result<GhRelease, String> {
+fn fetch_release_by_tag(
+    client: &reqwest::blocking::Client,
+    tag: &str,
+) -> Result<GhRelease, String> {
     let url = format!("https://api.github.com/repos/{CDDA_REPO}/releases/tags/{tag}");
     let response = client
         .get(&url)
@@ -461,7 +462,7 @@ fn download_file(
     phase: &Arc<Mutex<DownloadPhase>>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let client = http_client()?;
+    let client = github_client()?;
     let mut response = client
         .get(url)
         .send()
@@ -689,26 +690,4 @@ mod tests {
             "expected at least one stable build with a compatible asset"
         );
     }
-}
-
-fn http_client() -> Result<Client, String> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::ACCEPT,
-        "application/vnd.github+json".parse().unwrap(),
-    );
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {token}").parse().unwrap(),
-            );
-        }
-    }
-
-    Client::builder()
-        .user_agent(USER_AGENT)
-        .default_headers(headers)
-        .build()
-        .map_err(|error| format!("Failed to create HTTP client: {error}"))
 }
