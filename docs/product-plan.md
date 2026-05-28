@@ -47,8 +47,8 @@ commands.
 
 - show local project root, defaulting to `~/.local/cddock`
 - store game binaries under `versions/<release-tag>` (Catapult `current/`, catman `builds/`)
-- store shared user data under `userdata-stable/` and `userdata-experimental/` (Catapult/catman userdata split)
-- keep stable and experimental saves separate to reduce cross-channel corruption (catman)
+- store shared user data under one `userdata/` directory across installed builds (Catapult/catman userdata model)
+- keep one shared userdata directory and rely on backups before risky channel/build switches
 - support multiple installed versions side by side
 - select/switch active build
 - manage saves/config backup

@@ -1,3 +1,4 @@
+mod backup;
 mod builds;
 mod config;
 mod guide;
@@ -57,6 +58,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
     loop {
         app.poll_download();
         app.poll_release_fetch();
+        app.refresh_game_pid();
         if app.overlay.is_none() {
             app.refresh_installed_builds();
         }
@@ -65,6 +67,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if app.handle_key(key) => return Ok(()),
+                Event::Paste(text) if app.handle_paste(&text) => return Ok(()),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -174,7 +177,10 @@ impl Page {
 
     fn subtitle(self, language: Language) -> &'static str {
         match self {
-            Page::Home => language.text("Status and quick launch", "状态和快速启动"),
+            Page::Home => language.text(
+                "Switch build and enter game (one instance)",
+                "切换版本并进入游戏（单进程）",
+            ),
             Page::Builds => language.text(
                 "Installed builds and active version",
                 "已安装版本和当前版本",
@@ -198,12 +204,12 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     LaunchCdda,
-    QuickResume,
     InstallGame,
     SelectStableChannel,
     SelectExperimentalChannel,
     BackToBuilds,
     SelectExistingBuild,
+    BackupSaves,
     SearchGuide,
     ShowGuideVersion,
     ShowActiveBuild,
@@ -218,8 +224,7 @@ enum Action {
 impl Action {
     fn label(self, language: Language) -> &'static str {
         match self {
-            Self::LaunchCdda => language.text("Launch CDDA", "启动 CDDA"),
-            Self::QuickResume => language.text("Quick return to last world", "快速回到上次世界"),
+            Self::LaunchCdda => language.text("Enter game", "进入游戏"),
             Self::InstallGame => language.text("Install game", "安装游戏"),
             Self::SelectStableChannel => language.text("Fetch stable list", "获取稳定版列表"),
             Self::SelectExperimentalChannel => {
@@ -227,6 +232,7 @@ impl Action {
             }
             Self::BackToBuilds => language.text("Back to versions", "返回版本页"),
             Self::SelectExistingBuild => language.text("Switch build", "切换版本"),
+            Self::BackupSaves => language.text("Backup saves", "备份存档"),
             Self::SearchGuide => language.text("Search guide data", "搜索图鉴数据"),
             Self::ShowGuideVersion => language.text("Show guide version", "查看图鉴版本"),
             Self::ShowActiveBuild => language.text("Show active build", "查看当前版本"),
@@ -241,7 +247,7 @@ impl Action {
 
     fn badge(self) -> &'static str {
         match self {
-            Self::LaunchCdda | Self::QuickResume => "RUN",
+            Self::LaunchCdda => "RUN",
             Self::SearchGuide | Self::ShowGuideVersion => "GDE",
             Self::ToggleLanguage
             | Self::ShowConfigPath
@@ -252,6 +258,7 @@ impl Action {
             }
             Self::BackToBuilds | Self::BackToHome => "NAV",
             Self::SelectExistingBuild | Self::ShowActiveBuild => "USE",
+            Self::BackupSaves => "BAK",
             Self::QuitCddock => "EXT",
         }
     }
@@ -265,6 +272,12 @@ struct InstalledPicker {
     builds: Vec<builds::InstalledBuild>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedReleasePage {
+    items: Vec<ReleaseOption>,
+    has_more: bool,
+}
+
 #[derive(Debug)]
 struct ReleaseBrowser {
     channel: String,
@@ -273,7 +286,7 @@ struct ReleaseBrowser {
     index: usize,
     scroll_top: usize,
     has_more: bool,
-    cache: HashMap<u32, Vec<ReleaseOption>>,
+    cache: HashMap<u32, CachedReleasePage>,
     loading: bool,
 }
 
@@ -285,10 +298,9 @@ struct ReleaseFetchJob {
 }
 
 #[derive(Debug)]
-struct LaunchPicker {
-    items: Vec<String>,
-    worlds: Vec<Option<String>>,
-    index: usize,
+enum Overlay {
+    Installed(InstalledPicker),
+    ReleaseBrowser(ReleaseBrowser),
 }
 
 #[derive(Debug)]
@@ -300,13 +312,6 @@ struct GuideSearch {
     index: usize,
     scroll_top: usize,
     detail: Option<guide::GuideSearchResult>,
-}
-
-#[derive(Debug)]
-enum Overlay {
-    Installed(InstalledPicker),
-    ReleaseBrowser(ReleaseBrowser),
-    Launch(LaunchPicker),
 }
 
 #[derive(Debug)]
@@ -347,8 +352,9 @@ impl Default for App {
         let game_root = config.game_root_path();
         let channel = config.release_channel.clone();
         let _ = paths::ensure_layout(&game_root, &channel);
-        let _ = paths::migrate_legacy_layout(&game_root, &channel);
-        let _ = config.save(&config_path);
+        if paths::consolidate_userdata(&game_root).unwrap_or(false) {
+            let _ = config.save(&config_path);
+        }
 
         Self {
             config,
@@ -432,6 +438,7 @@ impl App {
                         .to_string();
                 }
                 self.builds_dirty = true;
+                let _ = paths::consolidate_userdata(&self.game_root());
                 self.download = None;
             }
             DownloadPhase::Failed(error) => {
@@ -486,12 +493,18 @@ impl App {
         browser.has_more = page.has_more;
         browser.index = 0;
         browser.scroll_top = 0;
-        browser.cache.insert(page.page, page.items);
+        browser.cache.insert(
+            page.page,
+            CachedReleasePage {
+                items: page.items,
+                has_more: page.has_more,
+            },
+        );
 
         if browser
             .cache
             .get(&browser.page)
-            .is_some_and(|items| items.is_empty())
+            .is_some_and(|cached| cached.items.is_empty())
         {
             if browser.has_more {
                 self.message = self
@@ -515,7 +528,7 @@ impl App {
                 browser
                     .cache
                     .get(&browser.page)
-                    .map(|items| items.len())
+                    .map(|cached| cached.items.len())
                     .unwrap_or(0),
                 self.language.text("builds", "个版本"),
             );
@@ -542,6 +555,14 @@ impl App {
             page,
             receiver,
         });
+    }
+
+    fn refresh_game_pid(&mut self) {
+        if let Some(pid) = self.game_pid
+            && !launch::is_process_alive(pid)
+        {
+            self.game_pid = None;
+        }
     }
 
     fn refresh_installed_builds(&mut self) {
@@ -648,24 +669,27 @@ impl App {
                 KeyCode::Enter => self.confirm_release_browser(),
                 _ => {}
             },
-            Some(Overlay::Launch(picker)) => match key.code {
-                KeyCode::Esc => self.close_overlay(),
-                KeyCode::Char('k') | KeyCode::Up => {
-                    picker.index = picker
-                        .index
-                        .checked_sub(1)
-                        .unwrap_or(picker.items.len().saturating_sub(1));
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if !picker.items.is_empty() {
-                        picker.index = (picker.index + 1) % picker.items.len();
-                    }
-                }
-                KeyCode::Enter => self.confirm_launch_picker(),
-                _ => {}
-            },
             None => {}
         }
+        false
+    }
+
+    fn handle_paste(&mut self, text: &str) -> bool {
+        if self.page() != Page::Guide {
+            return false;
+        }
+        let Some(search) = self.guide_search.as_mut() else {
+            return false;
+        };
+        if search.detail.is_some() {
+            return false;
+        }
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            search.query.push(ch);
+        }
+        search.results.clear();
+        search.index = 0;
+        search.scroll_top = 0;
         false
     }
 
@@ -758,11 +782,11 @@ impl App {
         let Some(Overlay::ReleaseBrowser(browser)) = self.overlay.take() else {
             return;
         };
-        let Some(items) = browser.cache.get(&browser.page) else {
+        let Some(cached) = browser.cache.get(&browser.page) else {
             self.overlay = Some(Overlay::ReleaseBrowser(browser));
             return;
         };
-        let Some(release) = items.get(browser.index).cloned() else {
+        let Some(release) = cached.items.get(browser.index).cloned() else {
             self.message = self
                 .language
                 .text("No release selected.", "未选择发布版本。")
@@ -772,57 +796,7 @@ impl App {
         self.start_release_download(release);
     }
 
-    fn open_launch_picker(&mut self) {
-        let Some((_, userdata)) = self.active_build_and_userdata() else {
-            self.message = self
-                .language
-                .text(
-                    "No active build selected. Choose one under Versions.",
-                    "未选择当前版本，请先在版本页选择。",
-                )
-                .to_string();
-            return;
-        };
-
-        let last_world = builds::find_most_recent_world(&userdata);
-        let mut items = vec![self.language.text("Enter game", "进入游戏").to_string()];
-        let mut worlds = vec![None];
-        if let Some(world) = last_world {
-            items.push(format!(
-                "{}: {world}",
-                self.language
-                    .text("Enter last played world", "进入最后游玩的世界")
-            ));
-            worlds.push(Some(world));
-        }
-
-        self.overlay = Some(Overlay::Launch(LaunchPicker {
-            items,
-            worlds,
-            index: 0,
-        }));
-        self.message = self
-            .language
-            .text("Choose how to launch CDDA.", "选择启动 CDDA 的方式。")
-            .to_string();
-    }
-
-    fn confirm_launch_picker(&mut self) {
-        let Some(Overlay::Launch(picker)) = self.overlay.take() else {
-            return;
-        };
-        let world = picker.worlds.get(picker.index).cloned().flatten();
-        self.message = self.launch_active_build(world.as_deref());
-    }
-
-    fn active_build_and_userdata(&self) -> Option<(PathBuf, PathBuf)> {
-        let path = builds::active_build_path(&self.game_root(), &self.config.active_build)?;
-        let channel = self.config.channel_for_build(&self.config.active_build);
-        let userdata = paths::userdata_dir(&self.game_root(), &channel);
-        Some((path, userdata))
-    }
-
-    fn launch_active_build(&mut self, world: Option<&str>) -> String {
+    fn enter_game(&mut self) -> String {
         let Some((path, userdata)) = self.active_build_and_userdata() else {
             return self
                 .language
@@ -844,47 +818,63 @@ impl App {
             );
         }
 
-        match launch::launch_build(&path, &userdata, world) {
+        let tracked = self.game_pid.take();
+        let stopped = launch::stop_cdda_instances(&self.game_root(), tracked).unwrap_or(0);
+
+        let world = builds::find_most_recent_world(&userdata);
+        match launch::launch_build(&path, &userdata, world.as_deref()) {
             Ok(pid) => {
                 self.game_pid = Some(pid);
-                if let Some(world) = world {
-                    format!(
-                        "{}: {world} (pid {pid})",
+                let mut parts =
+                    vec![self
+                    .language
+                    .text(
+                        "Closing any running CDDA instance, then launching the active build",
+                        "将关闭运行中的 CDDA 进程，并启动当前启用版本",
+                    )
+                    .to_string()];
+                if stopped > 0 {
+                    parts.push(format!(
+                        "({})",
                         self.language
-                            .text("Launched last played world", "已进入最后游玩的世界")
-                    )
-                } else {
-                    format!(
-                        "{} (pid {pid})",
-                        self.language.text("Launched CDDA", "已启动 CDDA")
-                    )
+                            .text("stopped previous instance", "已关闭先前进程")
+                    ));
                 }
+                if let Some(ref world_name) = world {
+                    parts.push(format!(
+                        "{}: {world_name}",
+                        self.language.text("Resuming last world", "继续上次世界")
+                    ));
+                }
+                parts.push(format!("pid {pid}"));
+                parts.join(" · ")
             }
             Err(error) => error,
         }
     }
 
-    fn quick_resume_last_world(&mut self) -> String {
-        let Some((_, userdata)) = self.active_build_and_userdata() else {
-            return self
-                .language
-                .text(
-                    "No active build selected. Choose one under Versions.",
-                    "未选择当前版本，请先在版本页选择。",
-                )
-                .to_string();
-        };
-        let Some(world) = builds::find_most_recent_world(&userdata) else {
-            return self
-                .language
-                .text("No last played world found.", "没有找到最后游玩的世界。")
-                .to_string();
-        };
+    fn active_build_and_userdata(&self) -> Option<(PathBuf, PathBuf)> {
+        let path = builds::active_build_path(&self.game_root(), &self.config.active_build)?;
+        let userdata = paths::shared_userdata_dir(&self.game_root());
+        Some((path, userdata))
+    }
 
-        if let Some(pid) = self.game_pid.take() {
-            let _ = launch::stop_game(pid);
+    fn backup_saves(&self) -> String {
+        let channel = if self.config.active_build.is_empty() {
+            self.config.release_channel.clone()
+        } else {
+            self.config.channel_for_build(&self.config.active_build)
+        };
+        match backup::backup_saves(&self.game_root(), &channel) {
+            Ok(path) => format!(
+                "{}: {path}",
+                self.language.text("Save backup created", "存档备份已创建")
+            ),
+            Err(error) => format!(
+                "{}: {error}",
+                self.language.text("Save backup failed", "存档备份失败")
+            ),
         }
-        self.launch_active_build(Some(&world))
     }
 
     fn open_guide_search(&mut self) {
@@ -996,40 +986,39 @@ impl App {
         }
     }
 
-    fn browser_items(&self) -> Option<&Vec<ReleaseOption>> {
+    fn browser_items(&self) -> Option<&[ReleaseOption]> {
         match self.overlay.as_ref()? {
-            Overlay::ReleaseBrowser(browser) => browser.cache.get(&browser.page),
-            Overlay::Installed(_) | Overlay::Launch(_) => None,
+            Overlay::ReleaseBrowser(browser) => browser
+                .cache
+                .get(&browser.page)
+                .map(|cached| cached.items.as_slice()),
+            Overlay::Installed(_) => None,
         }
     }
 
     fn browser_move_up(&mut self) {
-        let Some(items) = self.browser_items().cloned() else {
-            return;
-        };
-        if items.is_empty() {
+        let len = self.browser_items().map(|items| items.len()).unwrap_or(0);
+        if len == 0 {
             return;
         }
         let Some(Overlay::ReleaseBrowser(browser)) = self.overlay.as_mut() else {
             return;
         };
-        browser.index = browser.index.checked_sub(1).unwrap_or(items.len() - 1);
+        browser.index = browser.index.checked_sub(1).unwrap_or(len - 1);
         if browser.index < browser.scroll_top {
             browser.scroll_top = browser.index;
         }
     }
 
     fn browser_move_down(&mut self) {
-        let Some(items) = self.browser_items().cloned() else {
-            return;
-        };
-        if items.is_empty() {
+        let len = self.browser_items().map(|items| items.len()).unwrap_or(0);
+        if len == 0 {
             return;
         }
         let Some(Overlay::ReleaseBrowser(browser)) = self.overlay.as_mut() else {
             return;
         };
-        browser.index = (browser.index + 1) % items.len();
+        browser.index = (browser.index + 1) % len;
         const VIEWPORT: usize = 22;
         if browser.index + 1 >= browser.scroll_top + VIEWPORT {
             browser.scroll_top = browser.index.saturating_sub(VIEWPORT - 1);
@@ -1073,7 +1062,11 @@ impl App {
             browser.page = page;
             browser.index = 0;
             browser.scroll_top = 0;
-            browser.has_more = browser.cache.contains_key(&(page + 1));
+            browser.has_more = browser
+                .cache
+                .get(&page)
+                .map(|cached| cached.has_more)
+                .unwrap_or(false);
             return;
         }
 
@@ -1273,11 +1266,7 @@ impl App {
     fn activate(&mut self) {
         let action = self.actions().get(self.action_index).copied();
         self.message = match action {
-            Some(Action::LaunchCdda) => {
-                self.open_launch_picker();
-                return;
-            }
-            Some(Action::QuickResume) => self.quick_resume_last_world(),
+            Some(Action::LaunchCdda) => self.enter_game(),
             Some(Action::InstallGame) => {
                 self.open_page(Page::Install);
                 self.language
@@ -1347,6 +1336,7 @@ impl App {
                 self.open_installed_picker();
                 return;
             }
+            Some(Action::BackupSaves) => self.backup_saves(),
             Some(Action::SearchGuide) => {
                 self.open_guide_search();
                 return;
@@ -1413,13 +1403,13 @@ fn page_actions(page: Page) -> &'static [Action] {
         Page::Home => &[
             Action::SelectExistingBuild,
             Action::LaunchCdda,
-            Action::QuickResume,
             Action::QuitCddock,
         ],
         Page::Builds => &[
             Action::InstallGame,
             Action::SelectExistingBuild,
             Action::ShowActiveBuild,
+            Action::BackupSaves,
         ],
         Page::Install => &[
             Action::SelectStableChannel,
@@ -1462,7 +1452,6 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             Overlay::ReleaseBrowser(browser) => {
                 draw_release_browser(frame, area, browser, app.language)
             }
-            Overlay::Launch(picker) => draw_launch_overlay(frame, area, picker, app.language),
         }
     } else if let Some(job) = &app.download {
         draw_download_overlay(frame, area, app.language, job);
@@ -1743,41 +1732,6 @@ fn draw_installed_overlay(frame: &mut Frame<'_>, area: Rect, picker: &InstalledP
     frame.render_widget(list, popup);
 }
 
-fn draw_launch_overlay(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    picker: &LaunchPicker,
-    language: Language,
-) {
-    let popup = centered_rect(58, 30, area);
-    frame.render_widget(Clear, popup);
-
-    let items: Vec<ListItem<'_>> = picker
-        .items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let marker = if index == picker.index { ">" } else { " " };
-            let style = if index == picker.index {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            ListItem::new(format!("{marker} {item}")).style(style)
-        })
-        .collect();
-
-    let list = List::new(items).block(
-        Block::default()
-            .title(format!(" {} ", language.text("Launch CDDA", "启动 CDDA")))
-            .borders(Borders::ALL),
-    );
-    frame.render_widget(list, popup);
-}
-
 fn draw_release_browser(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1798,7 +1752,7 @@ fn draw_release_browser(
     let count = browser
         .cache
         .get(&browser.page)
-        .map(|items| items.len())
+        .map(|cached| cached.items.len())
         .unwrap_or(0);
     let page_hint = if browser.channel == "stable" {
         format!("{count} {}", language.text("stable builds", "个稳定版"))
@@ -1843,8 +1797,8 @@ fn draw_release_browser(
     let items = browser
         .cache
         .get(&browser.page)
-        .cloned()
-        .unwrap_or_default();
+        .map(|cached| cached.items.as_slice())
+        .unwrap_or(&[]);
 
     if items.is_empty() {
         let empty_text = if browser.loading {
@@ -2105,6 +2059,12 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
             Line::from("  Map D-pad or left stick to arrow keys."),
             Line::from("  Map A to Enter, B to Esc, Menu to q if desired."),
             Line::from("  Map L1/R1 to Tab or h/l for focus switching."),
+            Line::from(""),
+            Line::from("Virtual keyboard (Steam + X)"),
+            Line::from("  Steam OSK often shows but does not type into raw TUI/Konsole."),
+            Line::from("  Use ... > keyboard icon, or map only navigation keys in Steam Input."),
+            Line::from("  Guide search may accept pasted text if the OSK sends a paste event."),
+            Line::from("  CDDA is launched with SteamDeck=0 to improve in-game typing."),
         ],
         Language::Chinese => vec![
             Line::from("导航"),
@@ -2121,6 +2081,12 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect, language: Language) {
             Line::from("  将十字键或左摇杆映射为方向键。"),
             Line::from("  建议 A 映射 Enter，B 映射 Esc，菜单键映射 q。"),
             Line::from("  建议 L1/R1 映射 Tab 或 h/l，用于切换焦点。"),
+            Line::from(""),
+            Line::from("虚拟键盘 (Steam + X)"),
+            Line::from("  Steam 软键盘常会弹出，但无法向 Konsole/raw TUI 输入字符。"),
+            Line::from("  请用 ... > 键盘图标，或在 Steam Input 里只映射导航键。"),
+            Line::from("  图鉴搜索若 OSK 发送粘贴事件，可尝试粘贴输入。"),
+            Line::from("  启动 CDDA 时会设置 SteamDeck=0，改善游戏内输入。"),
         ],
     };
 
@@ -2182,22 +2148,24 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
         Page::Home => vec![
             kv_line("BUILD", active, Color::Green),
             kv_line(
+                "USER",
+                paths::shared_userdata_dir(&app.game_root())
+                    .display()
+                    .to_string(),
+                Color::Cyan,
+            ),
+            kv_line(
                 "FLOW",
                 language.text(
-                    "Switch build, launch, or quick return to the last world.",
-                    "切换版本、启动游戏，或快速回到上次世界。",
+                    "Enter game closes any running CDDA, then resumes the last world when available.",
+                    "进入游戏会先关闭运行中的 CDDA，并在有记录时继续上次世界。",
                 ),
                 Color::Yellow,
             ),
         ],
         Page::Builds => {
             let root = app.game_root();
-            let channel = if app.config.active_build.is_empty() {
-                app.config.release_channel.clone()
-            } else {
-                app.config.channel_for_build(&app.config.active_build)
-            };
-            let userdata = paths::userdata_dir(&root, &channel);
+            let userdata = paths::shared_userdata_dir(&root);
             let mut lines = vec![
                 kv_line("ROOT", root.display().to_string(), Color::Cyan),
                 kv_line("USER", userdata.display().to_string(), Color::Cyan),
@@ -2247,8 +2215,8 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
                 kv_line(
                     "SHARED",
                     language.text(
-                        "userdata-<channel>/ holds save, gfx, mods, etc.",
-                        "userdata-<通道>/ 存放 save、gfx、mods 等。",
+                        "userdata/ holds save, config, gfx, mods, sound, etc. for all builds.",
+                        "userdata/ 存放所有版本共用的 save、config、gfx、mods、sound 等。",
                     ),
                     Color::Gray,
                 ),
@@ -2383,6 +2351,38 @@ mod tests {
         assert_eq!(loaded.release_channel, "stable");
         assert_eq!(loaded.steam_shortcut_name, "Cataclysm: Dark Days Ahead");
         assert!(!loaded.use_steam_deck_konsole);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_loads_legacy_build_channel_string() {
+        let path = std::env::temp_dir().join(format!(
+            "cddock-legacy-config-test-{}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+language = "system"
+game_root = "~/.local/cddock/gfx"
+build_channels = "exp-1=experimental,0.H=stable"
+"#,
+        )
+        .expect("write legacy config");
+
+        let loaded = Config::load(&path);
+
+        assert_eq!(loaded.language, None);
+        assert_eq!(loaded.game_root, "~/.local/cddock");
+        assert_eq!(
+            loaded.build_channels.get("exp-1").map(String::as_str),
+            Some("experimental")
+        );
+        assert_eq!(
+            loaded.build_channels.get("0.H").map(String::as_str),
+            Some("stable")
+        );
 
         let _ = fs::remove_file(path);
     }

@@ -319,13 +319,6 @@ fn run_download(
             ));
         }
     }
-    if build_path.exists() {
-        return Err(format!(
-            "Build {} is already installed at {}",
-            release.build_id,
-            build_path.display()
-        ));
-    }
 
     fs::create_dir_all(downloads_dir(game_root)).map_err(|error| error.to_string())?;
     let archive_path = downloads_dir(game_root).join(&release.asset_name);

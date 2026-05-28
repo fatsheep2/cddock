@@ -34,8 +34,7 @@ pub fn match_asset_name(name: &str, os: OsName, arch: Arch, tiles: bool) -> bool
     let n = name.to_ascii_lowercase();
 
     if !n.ends_with(".tar.gz")
-        && !n.ends_with(".tar.xz")
-        && !n.ends_with(".tar.bz2")
+        && !n.ends_with(".tgz")
         && !n.ends_with(".zip")
         && !n.ends_with(".dmg")
     {
@@ -121,7 +120,7 @@ fn asset_priority(name: &str) -> u8 {
     if n.contains("with-graphics") || n.contains("tiles") {
         score = score.saturating_add(30);
     }
-    if n.ends_with(".tar.gz") || n.ends_with(".tar.xz") || n.ends_with(".tar.bz2") {
+    if n.ends_with(".tar.gz") || n.ends_with(".tgz") {
         score = score.saturating_add(20);
     } else if n.ends_with(".zip") {
         score = score.saturating_add(10);
@@ -130,4 +129,37 @@ fn asset_priority(name: &str) -> u8 {
         score = score.saturating_sub(5);
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_matches_extractable_archive_formats() {
+        assert!(match_asset_name(
+            "cdda-linux-tiles-x64.tar.gz",
+            OsName::Linux,
+            Arch::X64,
+            true
+        ));
+        assert!(match_asset_name(
+            "cdda-linux-tiles-x64.tgz",
+            OsName::Linux,
+            Arch::X64,
+            true
+        ));
+        assert!(!match_asset_name(
+            "cdda-linux-tiles-x64.tar.xz",
+            OsName::Linux,
+            Arch::X64,
+            true
+        ));
+        assert!(!match_asset_name(
+            "cdda-linux-tiles-x64.tar.bz2",
+            OsName::Linux,
+            Arch::X64,
+            true
+        ));
+    }
 }

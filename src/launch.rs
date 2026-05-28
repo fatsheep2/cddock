@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::{builds::find_executable, paths::logs_dir};
+use crate::{builds::find_executable, paths::logs_dir, paths::versions_dir};
 
 pub fn launch_build(
     build_path: &Path,
@@ -53,6 +53,12 @@ pub fn launch_build(
         command.arg("--world").arg(world);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        // Work around SDL text-input bugs when CDDA is started from a Steam shortcut.
+        command.env("SteamDeck", "0");
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -73,6 +79,126 @@ pub fn launch_build(
         .map_err(|error| format!("Failed to launch {}: {error}", executable.display()))?;
 
     Ok(child.id())
+}
+
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout);
+                text.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Stop tracked and any other CDDA processes launched from this game library.
+pub fn stop_cdda_instances(game_root: &Path, tracked_pid: Option<u32>) -> Result<u32, String> {
+    let mut stopped = 0u32;
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(pid) = tracked_pid
+        && is_process_alive(pid)
+    {
+        if stop_game(pid).is_ok() {
+            seen.insert(pid);
+            stopped += 1;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let versions = versions_dir(game_root);
+        let pattern = versions.to_string_lossy().to_string();
+        if !pattern.is_empty() {
+            if let Ok(output) = Command::new("pgrep").arg("-f").arg(&pattern).output() {
+                for line in output.stdout.split(|byte| *byte == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(text) = std::str::from_utf8(line) else {
+                        continue;
+                    };
+                    let Ok(pid) = text.trim().parse::<u32>() else {
+                        continue;
+                    };
+                    if seen.contains(&pid) || !is_process_alive(pid) {
+                        continue;
+                    }
+                    if stop_game(pid).is_ok() {
+                        seen.insert(pid);
+                        stopped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let versions = versions_dir(game_root);
+        let versions_text = versions.to_string_lossy().to_lowercase();
+        for image in ["cataclysm-tiles.exe", "cataclysm.exe"] {
+            let Ok(output) = Command::new("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
+                .output()
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let Some(pid_field) = line.split(',').nth(1) else {
+                    continue;
+                };
+                let pid_text = pid_field.trim_matches('"');
+                let Ok(pid) = pid_text.parse::<u32>() else {
+                    continue;
+                };
+                if seen.contains(&pid) || !is_process_alive(pid) {
+                    continue;
+                }
+                if let Ok(exe_output) = Command::new("wmic")
+                    .args([
+                        "process",
+                        "where",
+                        &format!("ProcessId={pid}"),
+                        "get",
+                        "ExecutablePath",
+                        "/value",
+                    ])
+                    .output()
+                {
+                    let exe_text = String::from_utf8_lossy(&exe_output.stdout).to_lowercase();
+                    if !exe_text.contains(&versions_text) {
+                        continue;
+                    }
+                }
+                if stop_game(pid).is_ok() {
+                    seen.insert(pid);
+                    stopped += 1;
+                }
+            }
+        }
+    }
+
+    Ok(stopped)
 }
 
 pub fn stop_game(pid: u32) -> Result<(), String> {

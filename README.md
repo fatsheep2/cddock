@@ -161,9 +161,9 @@ Implemented in the TUI:
 - select and persist the active build
 - fetch stable/experimental GitHub releases and download platform assets
 - extract builds into `~/.local/cddock/versions/<build-tag>`
-- keep shared user data in `userdata-stable/` and `userdata-experimental/` (Catapult/catman model)
+- keep shared user data in one `userdata/` directory across installed builds (Catapult/catman model)
 - launch with `--userdir` and optional `--world` (catman-style)
-- zip backups of the active channel's `save/` directory
+- zip backups of the shared `save/` directory from the Versions page
 - GitHub asset matching and stable-tag discovery inspired by catman
 
 Still placeholders:
@@ -178,9 +178,7 @@ The intended layout is:
 ~/.local/cddock/
   versions/
     cdda-experimental-2026-05-22-1007/   # game binaries only
-  userdata-experimental/
-    save/ gfx/ mods/ sound/ font/ config/ ...
-  userdata-stable/
+  userdata/
     save/ gfx/ mods/ sound/ font/ config/ ...
   downloads/            # temporary archives (catman-style)
   backups/              # zip save backups

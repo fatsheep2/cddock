@@ -12,10 +12,10 @@ pub fn expand_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         return home_dir().unwrap_or_else(|| PathBuf::from(path)).join(rest);
     }
-    if path == "~\\" || path.starts_with("~\\") {
-        if let Some(home) = home_dir() {
-            return home.join(path.trim_start_matches('~').trim_start_matches('\\'));
-        }
+    if (path == "~\\" || path.starts_with("~\\"))
+        && let Some(home) = home_dir()
+    {
+        return home.join(path.trim_start_matches('~').trim_start_matches('\\'));
     }
     PathBuf::from(path)
 }
@@ -48,13 +48,14 @@ pub fn downloads_dir(game_root: &Path) -> PathBuf {
     game_root.join("downloads")
 }
 
-/// Shared user data per release channel (catman: `userdata-stable` / `userdata-experimental`).
-pub fn userdata_dir(game_root: &Path, channel: &str) -> PathBuf {
-    game_root.join(format!("userdata-{channel}"))
+/// Shared userdata for all builds (config, save, mods, gfx, sound, ...).
+pub fn shared_userdata_dir(game_root: &Path) -> PathBuf {
+    game_root.join("userdata")
 }
 
-pub fn legacy_userdata_dir(game_root: &Path) -> PathBuf {
-    game_root.join("userdata")
+/// All builds launch with the same userdata directory regardless of channel.
+pub fn userdata_dir(game_root: &Path, _channel: &str) -> PathBuf {
+    shared_userdata_dir(game_root)
 }
 
 pub fn backups_dir(game_root: &Path) -> PathBuf {
@@ -82,11 +83,11 @@ pub const SHARED_USER_DIRS: &[&str] = &[
     "templates",
 ];
 
-pub fn ensure_layout(game_root: &Path, channel: &str) -> io::Result<()> {
+pub fn ensure_layout(game_root: &Path, _channel: &str) -> io::Result<()> {
     fs::create_dir_all(versions_dir(game_root))?;
     fs::create_dir_all(downloads_dir(game_root))?;
     fs::create_dir_all(backups_dir(game_root))?;
-    ensure_userdata_layout(&userdata_dir(game_root, channel))?;
+    ensure_userdata_layout(&shared_userdata_dir(game_root))?;
     Ok(())
 }
 
@@ -97,7 +98,7 @@ pub fn ensure_userdata_layout(userdata: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Move user dirs out of a fresh build into channel userdata (Catapult split install vs userdata).
+/// Move user dirs out of a fresh build into shared userdata (binaries-only install).
 pub fn promote_userdata_from_build(userdata: &Path, build_path: &Path) -> Result<(), String> {
     ensure_userdata_layout(userdata).map_err(|error| error.to_string())?;
     for name in SHARED_USER_DIRS {
@@ -132,9 +133,9 @@ fn promote_one_dir(build_path: &Path, name: &str, shared_target: PathBuf) -> Res
     })
 }
 
-/// Migrate flat `save/` / `gfx/` at project root or legacy `userdata/` into channel userdata.
-pub fn migrate_legacy_layout(game_root: &Path, channel: &str) -> io::Result<bool> {
-    let target = userdata_dir(game_root, channel);
+/// Merge legacy layouts and per-channel userdata into unified `userdata/`.
+pub fn consolidate_userdata(game_root: &Path) -> io::Result<bool> {
+    let target = shared_userdata_dir(game_root);
     ensure_userdata_layout(&target)?;
     let mut migrated = false;
 
@@ -147,21 +148,50 @@ pub fn migrate_legacy_layout(game_root: &Path, channel: &str) -> io::Result<bool
         }
     }
 
-    let legacy_userdata = legacy_userdata_dir(game_root);
-    if legacy_userdata.is_dir() {
+    for channel in ["stable", "experimental"] {
+        let channel_dir = game_root.join(format!("userdata-{channel}"));
+        if !channel_dir.is_dir() {
+            continue;
+        }
         for name in SHARED_USER_DIRS {
-            let src = legacy_userdata.join(name);
+            let src = channel_dir.join(name);
             if src.is_dir() {
                 migrate_tree_into(&src, &target.join(name))?;
                 migrated = true;
             }
         }
-        if legacy_userdata.read_dir()?.flatten().count() == 0 {
-            let _ = fs::remove_dir(legacy_userdata);
+        remove_dir_if_empty(&channel_dir);
+    }
+
+    let versions = versions_dir(game_root);
+    if versions.is_dir() {
+        for entry in fs::read_dir(versions)?.flatten() {
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let build_path = entry.path();
+            for name in SHARED_USER_DIRS {
+                let src = build_path.join(name);
+                if src.is_dir() {
+                    migrate_tree_into(&src, &target.join(name))?;
+                    let _ = fs::remove_dir_all(&src);
+                    migrated = true;
+                }
+            }
         }
     }
 
     Ok(migrated)
+}
+
+fn remove_dir_if_empty(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    if entries.flatten().next().is_some() {
+        return;
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 fn migrate_tree_into(src: &Path, dst: &Path) -> io::Result<()> {
@@ -203,4 +233,16 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn userdata_dir_is_shared_across_channels() {
+        let root = PathBuf::from("/tmp/cddock-test");
+        assert_eq!(userdata_dir(&root, "stable"), root.join("userdata"));
+        assert_eq!(userdata_dir(&root, "experimental"), root.join("userdata"));
+    }
 }

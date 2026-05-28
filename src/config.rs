@@ -5,8 +5,10 @@ use std::{
 };
 
 use crate::paths::{default_game_root, expand_path};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub language: Option<String>,
     pub cdda_path: String,
@@ -16,6 +18,63 @@ pub struct Config {
     pub steam_shortcut_name: String,
     pub use_steam_deck_konsole: bool,
     pub build_channels: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BuildChannelsConfig {
+    Map(HashMap<String, String>),
+    LegacyString(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ConfigFile {
+    language: Option<String>,
+    cdda_path: String,
+    game_root: String,
+    active_build: String,
+    release_channel: String,
+    steam_shortcut_name: String,
+    use_steam_deck_konsole: bool,
+    build_channels: Option<BuildChannelsConfig>,
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        let config = Config::default();
+        Self {
+            language: config.language,
+            cdda_path: config.cdda_path,
+            game_root: config.game_root,
+            active_build: config.active_build,
+            release_channel: config.release_channel,
+            steam_shortcut_name: config.steam_shortcut_name,
+            use_steam_deck_konsole: config.use_steam_deck_konsole,
+            build_channels: Some(BuildChannelsConfig::Map(config.build_channels)),
+        }
+    }
+}
+
+impl From<ConfigFile> for Config {
+    fn from(file: ConfigFile) -> Self {
+        let build_channels = match file.build_channels {
+            Some(BuildChannelsConfig::Map(map)) => map,
+            Some(BuildChannelsConfig::LegacyString(value)) => parse_build_channels(&value),
+            None => HashMap::new(),
+        };
+
+        Self {
+            language: normalize_language(file.language),
+            cdda_path: file.cdda_path,
+            game_root: normalize_game_root_value(&file.game_root),
+            active_build: file.active_build,
+            release_channel: file.release_channel,
+            steam_shortcut_name: file.steam_shortcut_name,
+            use_steam_deck_konsole: file.use_steam_deck_konsole,
+            build_channels,
+        }
+    }
 }
 
 impl Default for Config {
@@ -55,35 +114,9 @@ impl Config {
             return Self::default();
         };
 
-        let mut config = Self::default();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let value = parse_config_value(value);
-
-            match key {
-                "language" => config.language = Some(value),
-                "cdda_path" => config.cdda_path = value,
-                "game_root" => config.game_root = normalize_game_root_value(&value),
-                "active_build" => config.active_build = value,
-                "release_channel" => config.release_channel = value,
-                "steam_shortcut_name" => config.steam_shortcut_name = value,
-                "use_steam_deck_konsole" => {
-                    config.use_steam_deck_konsole = matches!(value.as_str(), "true" | "1" | "yes")
-                }
-                "build_channels" => config.build_channels = parse_build_channels(&value),
-                _ => {}
-            }
-        }
-
-        config
+        toml::from_str::<ConfigFile>(&content)
+            .map(Config::from)
+            .unwrap_or_else(|_| load_legacy_config(&content))
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -91,33 +124,50 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
 
-        let language = self.language.as_deref().unwrap_or("system");
-        let build_channels = format_build_channels(&self.build_channels);
-
-        let content = format!(
-            "# CDDock configuration\n\
-             # language: system, english, chinese\n\
-             # build_channels: tag=channel pairs separated by commas\n\
-             language = \"{}\"\n\
-             cdda_path = \"{}\"\n\
-             game_root = \"{}\"\n\
-             active_build = \"{}\"\n\
-             release_channel = \"{}\"\n\
-             steam_shortcut_name = \"{}\"\n\
-             use_steam_deck_konsole = {}\n\
-             build_channels = \"{}\"\n",
-            escape_config_string(language),
-            escape_config_string(&self.cdda_path),
-            escape_config_string(&self.game_root),
-            escape_config_string(&self.active_build),
-            escape_config_string(&self.release_channel),
-            escape_config_string(&self.steam_shortcut_name),
-            self.use_steam_deck_konsole,
-            escape_config_string(&build_channels),
-        );
+        let content = toml::to_string_pretty(self)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
         fs::write(path, content)
     }
+}
+
+fn normalize_language(language: Option<String>) -> Option<String> {
+    match language.as_deref() {
+        None | Some("system") | Some("") => None,
+        _ => language,
+    }
+}
+
+fn load_legacy_config(content: &str) -> Config {
+    let mut config = Config::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = parse_config_value(value);
+
+        match key {
+            "language" => config.language = normalize_language(Some(value)),
+            "cdda_path" => config.cdda_path = value,
+            "game_root" => config.game_root = normalize_game_root_value(&value),
+            "active_build" => config.active_build = value,
+            "release_channel" => config.release_channel = value,
+            "steam_shortcut_name" => config.steam_shortcut_name = value,
+            "use_steam_deck_konsole" => {
+                config.use_steam_deck_konsole = matches!(value.as_str(), "true" | "1" | "yes")
+            }
+            "build_channels" => config.build_channels = parse_build_channels(&value),
+            _ => {}
+        }
+    }
+
+    config
 }
 
 fn normalize_game_root_value(value: &str) -> String {
@@ -168,16 +218,6 @@ fn parse_build_channels(value: &str) -> HashMap<String, String> {
     map
 }
 
-fn format_build_channels(map: &HashMap<String, String>) -> String {
-    let mut pairs: Vec<_> = map.iter().collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
-        .into_iter()
-        .map(|(build, channel)| format!("{build}={channel}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 pub fn config_path() -> std::path::PathBuf {
     if cfg!(windows) {
         if let Ok(appdata) = std::env::var("APPDATA") {
@@ -211,8 +251,4 @@ fn parse_config_value(value: &str) -> String {
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(value)
         .replace("\\\"", "\"")
-}
-
-fn escape_config_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
