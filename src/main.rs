@@ -111,10 +111,25 @@ struct ReleaseFetchJob {
     receiver: Receiver<Result<install::ReleasePage, String>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SettingField {
+    GameRoot,
+    CddaPath,
+    SteamShortcutName,
+}
+
+#[derive(Debug)]
+struct TextInput {
+    title: String,
+    field: SettingField,
+    value: String,
+}
+
 #[derive(Debug)]
 enum Overlay {
     Installed(InstalledPicker),
     ReleaseBrowser(ReleaseBrowser),
+    TextInput(TextInput),
 }
 
 #[derive(Debug)]
@@ -483,12 +498,30 @@ impl App {
                 KeyCode::Enter => self.confirm_release_browser(),
                 _ => {}
             },
+            Some(Overlay::TextInput(input)) => match key.code {
+                KeyCode::Esc => self.close_overlay(),
+                KeyCode::Enter => self.confirm_text_input(),
+                KeyCode::Backspace => {
+                    input.value.pop();
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.value.push(ch);
+                }
+                _ => {}
+            },
             None => {}
         }
         false
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
+        if let Some(Overlay::TextInput(input)) = self.overlay.as_mut() {
+            input
+                .value
+                .extend(text.chars().filter(|ch| !ch.is_control()));
+            return false;
+        }
+
         if self.page() != Page::Guide {
             return false;
         }
@@ -562,6 +595,70 @@ impl App {
             .language
             .text("Selection cancelled.", "已取消选择。")
             .to_string();
+    }
+
+    fn open_text_input(&mut self, field: SettingField) {
+        let (title, value) = match field {
+            SettingField::GameRoot => (
+                self.language.text("Edit game root", "编辑游戏根目录"),
+                self.config.game_root.clone(),
+            ),
+            SettingField::CddaPath => (
+                self.language.text("Edit CDDA path", "编辑 CDDA 路径"),
+                self.config.cdda_path.clone(),
+            ),
+            SettingField::SteamShortcutName => (
+                self.language
+                    .text("Edit Steam shortcut name", "编辑 Steam 快捷方式名称"),
+                self.config.steam_shortcut_name.clone(),
+            ),
+        };
+        self.overlay = Some(Overlay::TextInput(TextInput {
+            title: title.to_string(),
+            field,
+            value,
+        }));
+        self.message = self
+            .language
+            .text(
+                "Edit value, Enter saves, Esc cancels.",
+                "编辑内容，Enter 保存，Esc 取消。",
+            )
+            .to_string();
+    }
+
+    fn confirm_text_input(&mut self) {
+        let Some(Overlay::TextInput(input)) = self.overlay.take() else {
+            return;
+        };
+        let value = input.value.trim().to_string();
+        if value.is_empty() {
+            self.message = self
+                .language
+                .text("Value cannot be empty.", "内容不能为空。")
+                .to_string();
+            return;
+        }
+
+        match input.field {
+            SettingField::GameRoot => {
+                self.config.game_root = value;
+                let _ = paths::ensure_layout(&self.game_root(), &self.config.release_channel);
+                self.builds_dirty = true;
+            }
+            SettingField::CddaPath => {
+                self.config.cdda_path = value;
+            }
+            SettingField::SteamShortcutName => {
+                self.config.steam_shortcut_name = value;
+            }
+        }
+
+        self.message = self.save_config_message(
+            self.language
+                .text("Setting updated", "设置已更新")
+                .to_string(),
+        );
     }
 
     fn confirm_installed_picker(&mut self) {
@@ -806,7 +903,7 @@ impl App {
                 .cache
                 .get(&browser.page)
                 .map(|cached| cached.items.as_slice()),
-            Overlay::Installed(_) => None,
+            Overlay::Installed(_) | Overlay::TextInput(_) => None,
         }
     }
 
@@ -1128,12 +1225,30 @@ impl App {
                     active
                 )
             }
-            Some(Action::SteamShortcutName) => format!(
-                "{}: {}",
-                self.language
-                    .text("Steam shortcut name", "Steam 快捷方式名称"),
-                self.config.steam_shortcut_name
-            ),
+            Some(Action::EditGameRoot) => {
+                self.open_text_input(SettingField::GameRoot);
+                return;
+            }
+            Some(Action::EditCddaPath) => {
+                self.open_text_input(SettingField::CddaPath);
+                return;
+            }
+            Some(Action::EditSteamShortcutName) => {
+                self.open_text_input(SettingField::SteamShortcutName);
+                return;
+            }
+            Some(Action::ToggleSteamDeckKonsole) => {
+                self.config.use_steam_deck_konsole = !self.config.use_steam_deck_konsole;
+                self.save_config_message(format!(
+                    "{}: {}",
+                    self.language.text("Konsole shortcut", "Konsole 快捷方式"),
+                    if self.config.use_steam_deck_konsole {
+                        self.language.text("enabled", "已启用")
+                    } else {
+                        self.language.text("disabled", "已禁用")
+                    }
+                ))
+            }
             Some(Action::SelectStableChannel) => {
                 self.config.release_channel = String::from("stable");
                 let _ = self.config.save(&self.config_path);
@@ -1233,6 +1348,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             Overlay::ReleaseBrowser(browser) => {
                 draw_release_browser(frame, area, browser, app.language)
             }
+            Overlay::TextInput(input) => draw_text_input_overlay(frame, area, input, app.language),
         }
     } else if let Some(job) = &app.download {
         draw_download_overlay(frame, area, app.language, job);
@@ -1511,6 +1627,30 @@ fn draw_installed_overlay(frame: &mut Frame<'_>, area: Rect, picker: &InstalledP
             .borders(Borders::ALL),
     );
     frame.render_widget(list, popup);
+}
+
+fn draw_text_input_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &TextInput,
+    language: Language,
+) {
+    let popup = centered_rect(70, 24, area);
+    frame.render_widget(Clear, popup);
+
+    let text = vec![
+        Line::from(input.value.as_str()),
+        Line::from(""),
+        Line::from(language.text("Enter saves. Esc cancels.", "Enter 保存，Esc 取消。")),
+    ];
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(format!(" {} ", input.title))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
 }
 
 fn draw_release_browser(
@@ -2034,10 +2174,20 @@ fn page_lines(app: &App) -> Vec<Line<'static>> {
         Page::Settings => vec![
             kv_line("CONFIG", app.config_path.display().to_string(), Color::Gray),
             kv_line("ROOT", app.config.game_root.clone(), Color::Cyan),
+            kv_line("CDDA", app.config.cdda_path.clone(), Color::Yellow),
             kv_line(
                 "STEAM",
                 app.config.steam_shortcut_name.clone(),
                 Color::Green,
+            ),
+            kv_line(
+                "KONSOLE",
+                if app.config.use_steam_deck_konsole {
+                    language.text("enabled", "已启用")
+                } else {
+                    language.text("disabled", "已禁用")
+                },
+                Color::Magenta,
             ),
         ],
         Page::Help => vec![

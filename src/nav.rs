@@ -137,8 +137,11 @@ pub enum Action {
     ShowGuideVersion,
     ShowActiveBuild,
     ToggleLanguage,
+    EditGameRoot,
+    EditCddaPath,
     ShowConfigPath,
-    SteamShortcutName,
+    EditSteamShortcutName,
+    ToggleSteamDeckKonsole,
     Controls,
     BackToHome,
     QuitCddock,
@@ -160,8 +163,15 @@ impl Action {
             Self::ShowGuideVersion => language.text("Show guide version", "查看图鉴版本"),
             Self::ShowActiveBuild => language.text("Show active build", "查看当前版本"),
             Self::ToggleLanguage => language.text("Switch language", "切换语言"),
+            Self::EditGameRoot => language.text("Edit game root", "编辑游戏根目录"),
+            Self::EditCddaPath => language.text("Edit CDDA path", "编辑 CDDA 路径"),
             Self::ShowConfigPath => language.text("Show config path", "显示配置路径"),
-            Self::SteamShortcutName => language.text("Steam shortcut name", "Steam 快捷方式名称"),
+            Self::EditSteamShortcutName => {
+                language.text("Edit Steam shortcut name", "编辑 Steam 快捷方式名称")
+            }
+            Self::ToggleSteamDeckKonsole => {
+                language.text("Toggle Konsole shortcut", "切换 Konsole 快捷方式")
+            }
             Self::Controls => language.text("Controls", "控制"),
             Self::BackToHome => language.text("Back to Home", "返回首页"),
             Self::QuitCddock => language.text("Quit CDDock", "退出 CDDock"),
@@ -173,8 +183,11 @@ impl Action {
             Self::LaunchCdda => "RUN",
             Self::SearchGuide | Self::ShowGuideVersion => "GDE",
             Self::ToggleLanguage
+            | Self::EditGameRoot
+            | Self::EditCddaPath
             | Self::ShowConfigPath
-            | Self::SteamShortcutName
+            | Self::EditSteamShortcutName
+            | Self::ToggleSteamDeckKonsole
             | Self::Controls => "SET",
             Self::InstallGame | Self::SelectStableChannel | Self::SelectExperimentalChannel => {
                 "GET"
@@ -212,10 +225,27 @@ pub fn page_actions(page: Page) -> &'static [Action] {
         ],
         Page::Settings => &[
             Action::ToggleLanguage,
+            Action::EditGameRoot,
+            Action::EditCddaPath,
+            Action::EditSteamShortcutName,
+            Action::ToggleSteamDeckKonsole,
             Action::ShowConfigPath,
-            Action::SteamShortcutName,
             Action::Controls,
         ],
         Page::Help => &[Action::BackToHome],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_page_exposes_editable_fields() {
+        let actions = page_actions(Page::Settings);
+        assert!(actions.contains(&Action::EditGameRoot));
+        assert!(actions.contains(&Action::EditCddaPath));
+        assert!(actions.contains(&Action::EditSteamShortcutName));
+        assert!(actions.contains(&Action::ToggleSteamDeckKonsole));
     }
 }
