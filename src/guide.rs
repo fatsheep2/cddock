@@ -125,7 +125,16 @@ pub fn load_dataset(game_root: &Path, build: &str, language: &str) -> Result<Gui
         load_translations_with_fallback(game_root, build, language);
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    collect_entries(&data, &translations, &mut seen, &mut entries);
+    let mut objects = Vec::new();
+    collect_objects(&data, &mut objects);
+    let object_index = object_id_index(&objects, &translations);
+    collect_entries(
+        &objects,
+        &object_index,
+        &translations,
+        &mut seen,
+        &mut entries,
+    );
     add_derived_fields(&data, &mut entries, &translations);
     Ok(GuideDataset {
         entries,
@@ -634,30 +643,55 @@ fn fetch_cached(url: &str, cache_path: &Path) -> Result<String, String> {
 }
 
 fn collect_entries(
-    value: &Value,
+    objects: &[&Map<String, Value>],
+    object_index: &HashMap<String, &Map<String, Value>>,
     translations: &HashMap<String, String>,
     seen: &mut HashSet<String>,
     entries: &mut Vec<GuideSearchResult>,
 ) {
-    match value {
-        Value::Object(map) => {
-            if let Some(result) = object_to_result(map, translations) {
-                let key = format!("{}:{}", result.kind, result.id);
-                if seen.insert(key) {
-                    entries.push(result);
-                }
-            }
-            for child in map.values() {
-                collect_entries(child, translations, seen, entries);
+    for map in objects {
+        let resolved = resolve_copy_from(map, object_index, translations, 0);
+        if let Some(result) = object_to_result(&resolved, translations) {
+            let key = format!("{}:{}", result.kind, result.id);
+            if seen.insert(key) {
+                entries.push(result);
             }
         }
-        Value::Array(values) => {
-            for child in values {
-                collect_entries(child, translations, seen, entries);
-            }
-        }
-        _ => {}
     }
+}
+
+fn object_id_index<'a>(
+    objects: &[&'a Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, &'a Map<String, Value>> {
+    let mut index = HashMap::new();
+    for map in objects {
+        if let Some(id) = field_text(map, "id", translations) {
+            index.entry(id).or_insert(*map);
+        }
+    }
+    index
+}
+
+fn resolve_copy_from(
+    map: &Map<String, Value>,
+    object_index: &HashMap<String, &Map<String, Value>>,
+    translations: &HashMap<String, String>,
+    depth: usize,
+) -> Map<String, Value> {
+    if depth > 16 {
+        return map.clone();
+    }
+    let mut resolved = map
+        .get("copy-from")
+        .and_then(|value| compact_value(value, translations))
+        .and_then(|parent_id| object_index.get(&parent_id).copied())
+        .map(|parent| resolve_copy_from(parent, object_index, translations, depth + 1))
+        .unwrap_or_default();
+    for (key, value) in map {
+        resolved.insert(key.clone(), value.clone());
+    }
+    resolved
 }
 
 fn object_to_result(
@@ -1323,6 +1357,68 @@ mod tests {
                 .any(|(key, value)| key == "extend" && value.contains("NEW_FLAG"))
         );
         assert_eq!(search_dataset(&dataset, "pocket_data", 10).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_resolves_copy_from_fields() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-inherit-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {
+                    "type":"GENERIC",
+                    "abstract":"base_pole",
+                    "id":"base_pole",
+                    "name":"base pole",
+                    "volume":"750 ml",
+                    "weight":"700 g",
+                    "material":["wood"],
+                    "flags":["SPEAR"]
+                },
+                {
+                    "type":"GENERIC",
+                    "id":"long_pole",
+                    "copy-from":"base_pole",
+                    "name":"long pole",
+                    "weight":"900 g"
+                }
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = dataset.get("long_pole").expect("long pole");
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| key == "volume" && value == "750 ml")
+        );
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| key == "weight" && value == "900 g")
+        );
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| key == "material" && value.contains("wood"))
+        );
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| key == "copy-from" && value == "base_pole")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
