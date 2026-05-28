@@ -138,6 +138,7 @@ struct GuideSearch {
     query: String,
     build: String,
     language: String,
+    language_note: Option<String>,
     results: Vec<guide::GuideSearchResult>,
     index: usize,
     scroll_top: usize,
@@ -801,6 +802,7 @@ impl App {
                     query: String::new(),
                     build,
                     language: lang,
+                    language_note: None,
                     results: Vec::new(),
                     index: 0,
                     scroll_top: 0,
@@ -843,6 +845,9 @@ impl App {
         if !cache_key_matches {
             match guide::load_dataset(&self.game_root(), &build, &language) {
                 Ok(dataset) => {
+                    if let Some(search) = self.guide_search.as_mut() {
+                        search.language_note = dataset.warning().map(str::to_string);
+                    }
                     self.guide_dataset = Some((build.clone(), language.clone(), dataset));
                 }
                 Err(error) => {
@@ -862,8 +867,21 @@ impl App {
             search.index = 0;
             search.scroll_top = 0;
         }
+        let dataset_status = self
+            .guide_dataset
+            .as_ref()
+            .map(|(_, _, dataset)| {
+                let lang = dataset.language();
+                let total = dataset.len();
+                dataset
+                    .warning()
+                    .map(|warning| format!("{warning} "))
+                    .unwrap_or_default()
+                    + &format!("lang {lang}, indexed {total}")
+            })
+            .unwrap_or_default();
         self.message = format!(
-            "{}: {count}",
+            "{}: {count}. {dataset_status}",
             self.language.text("Guide results", "图鉴结果")
         );
     }
@@ -1828,13 +1846,13 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(if search.language_note.is_some() { 5 } else { 4 }),
             Constraint::Min(6),
             Constraint::Length(2),
         ])
         .split(area);
 
-    let header = Paragraph::new(vec![
+    let mut header_lines = vec![
         Line::from(vec![
             Span::styled(
                 format!(" {} ", language.text("Guide Search", "图鉴搜索")),
@@ -1869,8 +1887,15 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
                 Style::default().fg(Color::Gray),
             ),
         ]),
-    ])
-    .block(
+    ];
+    if let Some(note) = &search.language_note {
+        header_lines.push(Line::from(vec![
+            Span::styled("[LANG] ", Style::default().fg(Color::Yellow)),
+            Span::raw(note.clone()),
+        ]));
+    }
+
+    let header = Paragraph::new(header_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
@@ -1894,8 +1919,8 @@ fn draw_guide_search(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, la
 fn draw_guide_results(frame: &mut Frame<'_>, area: Rect, search: &GuideSearch, language: Language) {
     if search.results.is_empty() {
         let empty = Paragraph::new(language.text(
-            "Type an id/name such as mon_sewer_fish, zombie, hammer, then press Enter.",
-            "输入 id/名称，例如 mon_sewer_fish、zombie、hammer，然后按 Enter。",
+            "Type an id/name/field such as zombie, hammer, rifle, recipe, tileset, then press Enter.",
+            "输入 id/名称/字段，例如 zombie、hammer、rifle、recipe、tileset，然后按 Enter。",
         ))
         .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: true });
@@ -1955,7 +1980,10 @@ fn draw_guide_detail(
     }
     lines.push(kv_line(
         "TILE",
-        language.text("tile preview is planned", "贴图预览待接入"),
+        language.text(
+            "tile/sprite preview needs local gfx parsing; related JSON fields are indexed",
+            "贴图预览需要解析本地 gfx；相关 JSON 字段已纳入索引",
+        ),
         Color::DarkGray,
     ));
     for (key, value) in &detail.fields {
