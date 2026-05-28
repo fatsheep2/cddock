@@ -18,7 +18,10 @@ use zip::ZipArchive;
 
 use crate::{
     builds::find_executable,
-    paths::{build_dir, downloads_dir, ensure_layout, promote_userdata_from_build, userdata_dir},
+    paths::{
+        build_dir, downloads_dir, ensure_layout, promote_userdata_from_build, userdata_dir,
+        versions_dir,
+    },
     platform::{detect_arch, detect_os, pick_best_asset_name},
 };
 
@@ -319,36 +322,71 @@ fn run_download(
             ));
         }
     }
+    let staging_path = staging_build_dir(game_root, &release.build_id);
+    if staging_path.exists() {
+        fs::remove_dir_all(&staging_path).map_err(|error| {
+            format!(
+                "Failed to remove stale staging build {}: {error}",
+                staging_path.display()
+            )
+        })?;
+    }
 
     fs::create_dir_all(downloads_dir(game_root)).map_err(|error| error.to_string())?;
     let archive_path = downloads_dir(game_root).join(&release.asset_name);
+    let partial_archive_path = archive_path.with_extension(format!(
+        "{}part",
+        archive_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ));
 
-    download_file(
+    if let Err(error) = download_file(
         &release.download_url,
-        &archive_path,
+        &partial_archive_path,
         release.size_bytes,
         phase,
         cancel,
-    )?;
-
-    if cancel.load(Ordering::Relaxed) {
-        return Err("Download cancelled".to_string());
+    ) {
+        let _ = fs::remove_file(&partial_archive_path);
+        return Err(error);
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        let _ = fs::remove_file(&partial_archive_path);
+        return Err("Download cancelled".to_string());
+    }
+    if archive_path.exists() {
+        fs::remove_file(&archive_path).map_err(|error| {
+            format!(
+                "Failed to replace existing archive {}: {error}",
+                archive_path.display()
+            )
+        })?;
+    }
+    fs::rename(&partial_archive_path, &archive_path).map_err(|error| {
+        format!(
+            "Failed to finalize archive {}: {error}",
+            archive_path.display()
+        )
+    })?;
+
     *phase.lock().expect("phase lock") = DownloadPhase::Extracting;
-    fs::create_dir_all(&build_path).map_err(|error| error.to_string())?;
-    if let Err(error) = extract_archive(&archive_path, &build_path) {
-        let _ = fs::remove_dir_all(&build_path);
+    fs::create_dir_all(&staging_path).map_err(|error| error.to_string())?;
+    if let Err(error) = extract_archive(&archive_path, &staging_path) {
+        let _ = fs::remove_dir_all(&staging_path);
         return Err(error);
     }
     let _ = fs::remove_file(&archive_path);
 
-    let content_root = if find_executable(&build_path).is_some() {
-        build_path.clone()
-    } else if let Some(nested) = find_single_top_level_dir(&build_path) {
+    let content_root = if find_executable(&staging_path).is_some() {
+        staging_path.clone()
+    } else if let Some(nested) = find_single_top_level_dir(&staging_path) {
         for entry in fs::read_dir(&nested).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
-            let target = build_path.join(entry.file_name());
+            let target = staging_path.join(entry.file_name());
             if target.exists() {
                 if entry
                     .file_type()
@@ -363,15 +401,57 @@ fn run_download(
             fs::rename(entry.path(), &target).map_err(|error| error.to_string())?;
         }
         fs::remove_dir_all(&nested).ok();
-        build_path.clone()
+        staging_path.clone()
     } else {
-        build_path.clone()
+        staging_path.clone()
     };
 
-    promote_userdata_from_build(&userdata, &content_root)?;
+    if find_executable(&content_root).is_none() {
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(format!(
+            "No CDDA executable found after extracting {}",
+            release.asset_name
+        ));
+    }
+
+    if let Err(error) = promote_userdata_from_build(&userdata, &content_root) {
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(error);
+    }
+
+    fs::rename(&staging_path, &build_path).map_err(|error| {
+        let _ = fs::remove_dir_all(&staging_path);
+        format!(
+            "Failed to finalize build {} at {}: {error}",
+            release.build_id,
+            build_path.display()
+        )
+    })?;
 
     *phase.lock().expect("phase lock") = DownloadPhase::Done;
     Ok(())
+}
+
+fn staging_build_dir(game_root: &Path, build_id: &str) -> PathBuf {
+    versions_dir(game_root).join(format!(".partial-{}", safe_path_component(build_id)))
+}
+
+fn safe_path_component(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "build".to_string()
+    } else {
+        safe
+    }
 }
 
 fn download_file(
@@ -587,6 +667,15 @@ fn pick_platform_asset(assets: &[GhAsset]) -> Option<GhAsset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_build_dir_uses_safe_hidden_name() {
+        let root = PathBuf::from("/tmp/cddock");
+        assert_eq!(
+            staging_build_dir(&root, "cdda/experimental:2026").file_name(),
+            Some(std::ffi::OsStr::new(".partial-cdda_experimental_2026"))
+        );
+    }
 
     #[test]
     fn stable_release_list_is_not_empty() {
