@@ -2004,17 +2004,23 @@ fn draw_guide_detail(
         ));
         lines.extend(render_image_preview_lines(&path, 18, 8));
     }
-    lines.push(kv_line(
-        "TILE",
-        language.text(
-            "tile/sprite preview needs local gfx parsing; related JSON fields are indexed",
-            "贴图预览需要解析本地 gfx；相关 JSON 字段已纳入索引",
-        ),
-        Color::DarkGray,
-    ));
-    for (key, value) in &detail.fields {
-        lines.push(kv_line("DATA", format!("{key}: {value}"), Color::Gray));
-    }
+    push_field_group(
+        &mut lines,
+        "REL",
+        detail,
+        &[
+            "crafted_by",
+            "used_by_recipe",
+            "uncraft_from",
+            "uncraft_uses",
+            "found_in_group",
+            "monster_source",
+            "monster_group",
+        ],
+        Color::Green,
+    );
+    push_field_group(&mut lines, "TILE", detail, &["tile_match"], Color::Magenta);
+    push_remaining_fields(&mut lines, detail);
     if !detail.raw_json.is_empty() {
         let mut raw = detail.raw_json.clone();
         const RAW_LIMIT: usize = 900;
@@ -2034,6 +2040,38 @@ fn draw_guide_detail(
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn push_field_group(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    detail: &guide::GuideSearchResult,
+    keys: &[&str],
+    color: Color,
+) {
+    for (key, value) in &detail.fields {
+        if keys.iter().any(|candidate| candidate == key) {
+            lines.push(kv_line(label, format!("{key}: {value}"), color));
+        }
+    }
+}
+
+fn push_remaining_fields(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSearchResult) {
+    const SPECIAL: &[&str] = &[
+        "crafted_by",
+        "used_by_recipe",
+        "uncraft_from",
+        "uncraft_uses",
+        "found_in_group",
+        "monster_source",
+        "monster_group",
+        "tile_match",
+    ];
+    for (key, value) in &detail.fields {
+        if !SPECIAL.iter().any(|candidate| candidate == key) {
+            lines.push(kv_line("DATA", format!("{key}: {value}"), Color::Gray));
+        }
+    }
 }
 
 fn guide_preview_path(detail: &guide::GuideSearchResult) -> Option<PathBuf> {

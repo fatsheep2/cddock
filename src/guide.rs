@@ -705,7 +705,68 @@ fn add_derived_fields(
             "recipe" => add_recipe_fields(map, entries, &index, translations, false),
             "uncraft" => add_recipe_fields(map, entries, &index, translations, true),
             "item_group" => add_item_group_fields(map, entries, &index, translations),
+            "MONSTER" => add_monster_fields(map, entries, &index, translations),
+            "monstergroup" => add_monster_group_fields(map, entries, &index, translations),
             _ => {}
+        }
+    }
+}
+
+fn add_monster_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(monster_id) = map
+        .get("id")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+
+    for key in ["death_drops", "harvest"] {
+        let Some(target_id) = map
+            .get(key)
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        if let Some(target) = index.get(&target_id).and_then(|idx| entries.get_mut(*idx)) {
+            target.fields.push((
+                "monster_source".to_string(),
+                format!("{monster_id} via {key}"),
+            ));
+        }
+    }
+}
+
+fn add_monster_group_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(group_id) = map
+        .get("name")
+        .or_else(|| map.get("id"))
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let monsters = map
+        .get("monsters")
+        .or_else(|| map.get("entries"))
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    for monster in monsters
+        .iter()
+        .filter(|monster| index.contains_key(*monster))
+    {
+        if let Some(target) = index.get(monster).and_then(|idx| entries.get_mut(*idx)) {
+            target
+                .fields
+                .push(("monster_group".to_string(), group_id.clone()));
         }
     }
 }
@@ -1091,6 +1152,55 @@ mod tests {
             pole.fields
                 .iter()
                 .any(|(key, value)| { key == "found_in_group" && value.contains("tools_common") })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_adds_monster_source_relationships() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-monster-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"item_group","id":"zombie_drops","items":[["long_pole", 10]]},
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"MONSTER","id":"mon_zombie","name":"zombie","death_drops":"zombie_drops"},
+                {"type":"monstergroup","name":"GROUP_ZOMBIE","monsters":[{"monster":"mon_zombie","freq":100}]}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let group = search_dataset(&dataset, "monster_source", 10)
+            .into_iter()
+            .find(|item| item.id == "zombie_drops")
+            .expect("drop group");
+        assert!(
+            group
+                .fields
+                .iter()
+                .any(|(key, value)| key == "monster_source" && value.contains("mon_zombie"))
+        );
+
+        let monster = search_dataset(&dataset, "GROUP_ZOMBIE", 10)
+            .into_iter()
+            .find(|item| item.id == "mon_zombie")
+            .expect("monster");
+        assert!(
+            monster
+                .fields
+                .iter()
+                .any(|(key, value)| key == "monster_group" && value == "GROUP_ZOMBIE")
         );
 
         let _ = fs::remove_dir_all(root);
