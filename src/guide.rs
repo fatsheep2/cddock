@@ -380,33 +380,42 @@ fn tile_match_summary(
             parts.push(format!("{key}: {value}"));
         }
     }
-    if let (Some(sheet), Some((tile_width, tile_height)), Some(tile_id)) = (
-        sheet,
-        tile_size,
-        map.get("fg").and_then(|value| value.as_u64()),
-    ) {
+    if let (Some(sheet), Some((tile_width, tile_height))) = (sheet, tile_size) {
         let sheet_path = tileset_dir.join(sheet);
         if let Some((image_width, _)) = png_dimensions(&sheet_path) {
             let columns = (image_width / tile_width).max(1);
-            let tile_id = tile_id as u32;
-            let x = (tile_id % columns) * tile_width;
-            let y = (tile_id / columns) * tile_height;
-            parts.push(format!("crop: {x},{y} {tile_width}x{tile_height}"));
-            if let Some(preview) = export_tile_preview(
-                &sheet_path,
-                preview_dir,
-                tileset,
-                sheet,
-                x,
-                y,
-                tile_width,
-                tile_height,
-            ) {
-                parts.push(format!("preview: {}", preview.display()));
+            for key in ["fg", "bg"] {
+                let Some(tile_id) = map.get(key).and_then(first_tile_sprite_index) else {
+                    continue;
+                };
+                let x = (tile_id % columns) * tile_width;
+                let y = (tile_id / columns) * tile_height;
+                parts.push(format!("{key}_crop: {x},{y} {tile_width}x{tile_height}"));
+                if let Some(preview) = export_tile_preview(
+                    &sheet_path,
+                    preview_dir,
+                    tileset,
+                    sheet,
+                    x,
+                    y,
+                    tile_width,
+                    tile_height,
+                ) {
+                    parts.push(format!("{key}_preview: {}", preview.display()));
+                }
             }
         }
     }
     parts.join("; ")
+}
+
+fn first_tile_sprite_index(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(number) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::Array(values) => values.iter().find_map(first_tile_sprite_index),
+        Value::Object(map) => map.values().find_map(first_tile_sprite_index),
+        _ => None,
+    }
 }
 
 fn export_tile_preview(
@@ -1636,8 +1645,8 @@ mod tests {
                 && value.contains("TestTiles")
                 && value.contains("items.png")
                 && value.contains("fg: 42")
-                && value.contains("crop: 0,672 32x32")
-                && value.contains("preview:")
+                && value.contains("fg_crop: 0,672 32x32")
+                && value.contains("fg_preview:")
         }));
         assert!(
             guide_cache_dir(&root)
@@ -1645,6 +1654,55 @@ mod tests {
                 .join("long_pole")
                 .is_dir()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn add_local_tile_info_exports_array_fg_and_bg_previews() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-tile-array-test-{}",
+            std::process::id()
+        ));
+        let build = "test-build";
+        let tileset = build_dir(&root, build).join("gfx").join("LayeredTiles");
+        fs::create_dir_all(&tileset).expect("tileset dir");
+        fs::write(
+            tileset.join("tile_config.json"),
+            r#"{
+                "tile_info": [{"width": 16, "height": 16}],
+                "tiles-new": [
+                    {
+                        "file": "items.png",
+                        "tiles": [
+                            {"id": "long_pole", "fg": [5, 6], "bg": {"sprite": 2}}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("tile config");
+        let image = image::RgbaImage::from_pixel(64, 32, image::Rgba([0, 255, 0, 255]));
+        image.save(tileset.join("items.png")).expect("png image");
+
+        let mut result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: Vec::new(),
+            raw_json: String::new(),
+        };
+        add_local_tile_info(&root, build, &mut result);
+
+        let tile = result
+            .fields
+            .iter()
+            .find_map(|(key, value)| (key == "tile_match").then_some(value))
+            .expect("tile match");
+        assert!(tile.contains("fg_crop: 16,16 16x16"));
+        assert!(tile.contains("bg_crop: 32,0 16x16"));
+        assert_eq!(tile.matches("preview:").count(), 2);
 
         let _ = fs::remove_dir_all(root);
     }

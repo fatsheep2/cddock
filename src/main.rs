@@ -2160,7 +2160,7 @@ fn draw_guide_detail(
     if !detail.description.is_empty() {
         lines.push(kv_line("DESC", detail.description.clone(), Color::Gray));
     }
-    if let Some(path) = guide_preview_path(detail) {
+    for path in guide_preview_paths(detail).into_iter().take(3) {
         lines.push(kv_line(
             "PREVIEW",
             path.display().to_string(),
@@ -2260,17 +2260,20 @@ fn push_remaining_fields(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSe
     }
 }
 
-fn guide_preview_path(detail: &guide::GuideSearchResult) -> Option<PathBuf> {
+fn guide_preview_paths(detail: &guide::GuideSearchResult) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     for (_, value) in &detail.fields {
-        let Some((_, path)) = value.rsplit_once("preview: ") else {
-            continue;
-        };
-        let path = path.trim();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
+        for segment in value.split("preview: ").skip(1) {
+            let path = segment.split(';').next().unwrap_or_default().trim();
+            if !path.is_empty() {
+                let path = PathBuf::from(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
         }
     }
-    None
+    paths
 }
 
 fn render_image_preview_lines(path: &Path, max_width: u32, max_rows: u32) -> Vec<Line<'static>> {
