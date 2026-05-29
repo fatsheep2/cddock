@@ -128,14 +128,12 @@ pub fn load_dataset(game_root: &Path, build: &str, language: &str) -> Result<Gui
     let mut objects = Vec::new();
     collect_objects(&data, &mut objects);
     let object_index = object_id_index(&objects, &translations);
-    collect_entries(
-        &objects,
-        &object_index,
-        &translations,
-        &mut seen,
-        &mut entries,
-    );
-    add_derived_fields(&data, &mut entries, &translations);
+    let resolved_objects = objects
+        .iter()
+        .map(|map| resolve_copy_from(map, &object_index, &translations, 0))
+        .collect::<Vec<_>>();
+    collect_entries(&resolved_objects, &translations, &mut seen, &mut entries);
+    add_derived_fields(&resolved_objects, &mut entries, &translations);
     Ok(GuideDataset {
         entries,
         language: actual_language,
@@ -658,15 +656,13 @@ fn fetch_cached(url: &str, cache_path: &Path) -> Result<String, String> {
 }
 
 fn collect_entries(
-    objects: &[&Map<String, Value>],
-    object_index: &HashMap<String, &Map<String, Value>>,
+    objects: &[Map<String, Value>],
     translations: &HashMap<String, String>,
     seen: &mut HashSet<String>,
     entries: &mut Vec<GuideSearchResult>,
 ) {
     for map in objects {
-        let resolved = resolve_copy_from(map, object_index, translations, 0);
-        if let Some(result) = object_to_result(&resolved, translations) {
+        if let Some(result) = object_to_result(map, translations) {
             let key = format!("{}:{}", result.kind, result.id);
             if seen.insert(key) {
                 entries.push(result);
@@ -954,6 +950,9 @@ fn object_to_result(
     for key in PRIMARY_FIELDS {
         add_compact_field(&mut fields, map, key, translations);
     }
+    for summary in pocket_summaries(map.get("pocket_data"), translations) {
+        fields.push(("pocket_summary".to_string(), summary));
+    }
     let mut extra_keys = map.keys().map(String::as_str).collect::<Vec<_>>();
     extra_keys.sort_unstable();
     for key in extra_keys {
@@ -1004,8 +1003,66 @@ fn add_compact_field(
     }
 }
 
+fn pocket_summaries(value: Option<&Value>, translations: &HashMap<String, String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| pocket_summary(value, translations))
+            .collect(),
+        Value::Object(_) => pocket_summary(value, translations).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn pocket_summary(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
+    let Value::Object(map) = value else {
+        return compact_value(value, translations);
+    };
+    let mut parts = Vec::new();
+    let pocket_type =
+        field_text(map, "pocket_type", translations).unwrap_or_else(|| "pocket".into());
+    parts.push(pocket_type);
+
+    for (key, label) in [
+        ("max_contains_volume", "volume"),
+        ("max_contains_weight", "weight"),
+        ("max_item_length", "length"),
+        ("moves", "moves"),
+        ("rigid", "rigid"),
+        ("holster", "holster"),
+        ("watertight", "watertight"),
+        ("airtight", "airtight"),
+    ] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+
+    let ammo = extract_ammo_restrictions(value);
+    if !ammo.is_empty() {
+        parts.push(format!("ammo: {}", ammo.join(", ")));
+    }
+
+    if let Some(value) = map
+        .get("sealed_data")
+        .and_then(|value| compact_value(value, translations))
+    {
+        parts.push(format!("sealed: {value}"));
+    }
+
+    let summary = parts.join("; ");
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
 fn add_derived_fields(
-    data: &Value,
+    objects: &[Map<String, Value>],
     entries: &mut [GuideSearchResult],
     translations: &HashMap<String, String>,
 ) {
@@ -1014,27 +1071,141 @@ fn add_derived_fields(
         index.insert(entry.id.clone(), idx);
     }
 
-    let mut objects = Vec::new();
-    collect_objects(data, &mut objects);
-    for map in &objects {
+    let group_index = item_group_index(objects, translations);
+    let requirement_index = requirement_index(objects, translations);
+    for map in objects {
         let kind = map
             .get("type")
             .and_then(|value| compact_value(value, translations))
             .unwrap_or_default();
         match kind.as_str() {
-            "recipe" => add_recipe_fields(map, entries, &index, translations, false),
-            "uncraft" => add_recipe_fields(map, entries, &index, translations, true),
-            "item_group" => add_item_group_fields(map, entries, &index, translations),
+            "recipe" => add_recipe_fields(
+                map,
+                entries,
+                &index,
+                &requirement_index,
+                translations,
+                false,
+            ),
+            "uncraft" => {
+                add_recipe_fields(map, entries, &index, &requirement_index, translations, true)
+            }
+            "item_group" => add_item_group_fields(map, entries, &index, &group_index, translations),
             "MONSTER" => add_monster_fields(map, entries, &index, translations),
             "monstergroup" => add_monster_group_fields(map, entries, &index, translations),
             _ => {}
         }
+        add_ammo_magazine_fields(map, entries, &index, translations);
     }
-    add_cross_reference_fields(&objects, entries, &index, translations);
+    add_cross_reference_fields(objects, entries, &index, translations);
+}
+
+fn item_group_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, Vec<String>> {
+    let mut groups = HashMap::new();
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        if kind != "item_group" {
+            continue;
+        }
+        let Some(group_id) = map
+            .get("id")
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        let tokens = map
+            .get("items")
+            .or_else(|| map.get("entries"))
+            .map(extract_string_tokens)
+            .unwrap_or_default();
+        groups.insert(group_id, tokens);
+    }
+    groups
+}
+
+#[derive(Debug, Default, Clone)]
+struct RequirementParts {
+    components: Vec<String>,
+    tools: Vec<String>,
+    using: Vec<String>,
+}
+
+fn requirement_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, RequirementParts> {
+    let mut requirements = HashMap::new();
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        if kind != "requirement" {
+            continue;
+        }
+        let Some(id) = map
+            .get("id")
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        requirements.insert(id, requirement_parts(map));
+    }
+    requirements
+}
+
+fn requirement_parts(map: &Map<String, Value>) -> RequirementParts {
+    RequirementParts {
+        components: map
+            .get("components")
+            .map(extract_string_tokens)
+            .unwrap_or_default(),
+        tools: map
+            .get("tools")
+            .map(extract_string_tokens)
+            .unwrap_or_default(),
+        using: map
+            .get("using")
+            .map(extract_string_tokens)
+            .unwrap_or_default(),
+    }
+}
+
+fn expand_requirement_parts(
+    requirement_id: &str,
+    requirement_index: &HashMap<String, RequirementParts>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) -> RequirementParts {
+    if depth > 16 || !seen.insert(requirement_id.to_string()) {
+        return RequirementParts::default();
+    }
+    let Some(requirement) = requirement_index.get(requirement_id) else {
+        seen.remove(requirement_id);
+        return RequirementParts::default();
+    };
+    let mut expanded = requirement.clone();
+    for nested_id in &requirement.using {
+        let nested = expand_requirement_parts(nested_id, requirement_index, seen, depth + 1);
+        expanded.components.extend(nested.components);
+        expanded.tools.extend(nested.tools);
+    }
+    expanded.components.sort();
+    expanded.components.dedup();
+    expanded.tools.sort();
+    expanded.tools.dedup();
+    seen.remove(requirement_id);
+    expanded
 }
 
 fn add_cross_reference_fields(
-    objects: &[&Map<String, Value>],
+    objects: &[Map<String, Value>],
     entries: &mut [GuideSearchResult],
     index: &HashMap<String, usize>,
     translations: &HashMap<String, String>,
@@ -1063,7 +1234,7 @@ fn add_cross_reference_fields(
         } else {
             format!("{kind}:{source_id}")
         };
-        for token in extract_string_tokens(&Value::Object((*map).clone())) {
+        for token in extract_string_tokens(&Value::Object(map.clone())) {
             if token == source_id {
                 continue;
             }
@@ -1141,10 +1312,61 @@ fn add_monster_group_fields(
     }
 }
 
+fn add_ammo_magazine_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(source_id) = object_identity_id(
+        map,
+        &map.get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default(),
+        translations,
+    ) else {
+        return;
+    };
+
+    for ammo in map
+        .get("ammo")
+        .map(extract_string_tokens)
+        .unwrap_or_default()
+        .iter()
+        .filter(|ammo| index.contains_key(*ammo))
+    {
+        push_relation(entries, index, ammo, "ammo_used_by", &source_id);
+    }
+
+    for magazine in map
+        .get("magazines")
+        .or_else(|| map.get("magazine"))
+        .or_else(|| map.get("magazine_well"))
+        .map(extract_string_tokens)
+        .unwrap_or_default()
+        .iter()
+        .filter(|magazine| index.contains_key(*magazine))
+    {
+        push_relation(entries, index, magazine, "magazine_for", &source_id);
+    }
+
+    for ammo in map
+        .get("pocket_data")
+        .map(extract_ammo_restrictions)
+        .unwrap_or_default()
+        .iter()
+        .filter(|ammo| index.contains_key(*ammo))
+    {
+        push_relation(entries, index, ammo, "ammo_contained_by", &source_id);
+        push_relation(entries, index, &source_id, "contains_ammo", ammo);
+    }
+}
+
 fn add_item_group_fields(
     map: &Map<String, Value>,
     entries: &mut [GuideSearchResult],
     index: &HashMap<String, usize>,
+    group_index: &HashMap<String, Vec<String>>,
     translations: &HashMap<String, String>,
 ) {
     let Some(group_id) = map
@@ -1157,27 +1379,122 @@ fn add_item_group_fields(
         .get("subtype")
         .and_then(|value| compact_value(value, translations))
         .unwrap_or_default();
-    let items = map
-        .get("items")
-        .or_else(|| map.get("entries"))
-        .map(extract_string_tokens)
-        .unwrap_or_default();
+    let base_label = if subtype.is_empty() {
+        group_id.clone()
+    } else {
+        format!("{group_id} ({subtype})")
+    };
+    let mut seen = HashSet::new();
+    for (item, path) in expand_item_group_members(&group_id, group_index, &mut seen, 0) {
+        let Some(target) = index.get(&item).and_then(|idx| entries.get_mut(*idx)) else {
+            continue;
+        };
+        let label = if path.is_empty() {
+            base_label.clone()
+        } else {
+            format!("{base_label} via {}", path.join(" > "))
+        };
+        if !target
+            .fields
+            .iter()
+            .any(|(key, value)| key == "found_in_group" && value == &label)
+        {
+            target.fields.push(("found_in_group".to_string(), label));
+        }
+    }
+}
 
-    for item in items.iter().filter(|item| index.contains_key(*item)) {
-        if let Some(target) = index.get(item).and_then(|idx| entries.get_mut(*idx)) {
-            let label = if subtype.is_empty() {
-                group_id.clone()
-            } else {
-                format!("{group_id} ({subtype})")
-            };
-            if !target
-                .fields
-                .iter()
-                .any(|(key, value)| key == "found_in_group" && value == &label)
-            {
-                target.fields.push(("found_in_group".to_string(), label));
+fn expand_item_group_members(
+    group_id: &str,
+    group_index: &HashMap<String, Vec<String>>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) -> Vec<(String, Vec<String>)> {
+    if depth > 16 || !seen.insert(group_id.to_string()) {
+        return Vec::new();
+    }
+    let mut members = Vec::new();
+    for token in group_index.get(group_id).into_iter().flatten() {
+        if group_index.contains_key(token) {
+            for (item, mut path) in expand_item_group_members(token, group_index, seen, depth + 1) {
+                path.insert(0, token.clone());
+                members.push((item, path));
+            }
+        } else {
+            members.push((token.clone(), Vec::new()));
+        }
+    }
+    seen.remove(group_id);
+    members.sort();
+    members.dedup();
+    members
+}
+
+fn push_relation(
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    target_id: &str,
+    key: &str,
+    value: &str,
+) {
+    let Some(target) = index.get(target_id).and_then(|idx| entries.get_mut(*idx)) else {
+        return;
+    };
+    if !target
+        .fields
+        .iter()
+        .any(|(candidate_key, candidate_value)| candidate_key == key && candidate_value == value)
+    {
+        target.fields.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn extract_ammo_restrictions(value: &Value) -> Vec<String> {
+    let mut tokens = Vec::new();
+    collect_ammo_restrictions(value, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn collect_ammo_restrictions(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for key in ["ammo_restriction", "ammo_restrictions", "ammo"] {
+                if let Some(value) = map.get(key) {
+                    tokens.extend(extract_string_tokens(value));
+                    collect_object_keys(value, tokens);
+                }
+            }
+            for child in map.values() {
+                collect_ammo_restrictions(child, tokens);
             }
         }
+        Value::Array(values) => {
+            for child in values {
+                collect_ammo_restrictions(child, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_object_keys(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if looks_like_item_id(key) {
+                    tokens.push(key.clone());
+                }
+                collect_object_keys(child, tokens);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_object_keys(child, tokens);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1202,6 +1519,7 @@ fn add_recipe_fields(
     map: &Map<String, Value>,
     entries: &mut [GuideSearchResult],
     index: &HashMap<String, usize>,
+    requirement_index: &HashMap<String, RequirementParts>,
     translations: &HashMap<String, String>,
     uncraft: bool,
 ) {
@@ -1217,14 +1535,29 @@ fn add_recipe_fields(
         .get("time")
         .and_then(|value| compact_value(value, translations))
         .unwrap_or_default();
-    let components = map
+    let mut components = map
         .get("components")
         .map(extract_string_tokens)
         .unwrap_or_default();
-    let tools = map
+    let mut tools = map
         .get("tools")
         .map(extract_string_tokens)
         .unwrap_or_default();
+    for requirement_id in map
+        .get("using")
+        .map(extract_string_tokens)
+        .unwrap_or_default()
+    {
+        let mut seen = HashSet::new();
+        let requirement =
+            expand_requirement_parts(&requirement_id, requirement_index, &mut seen, 0);
+        components.extend(requirement.components);
+        tools.extend(requirement.tools);
+    }
+    components.sort();
+    components.dedup();
+    tools.sort();
+    tools.dedup();
     let byproducts = map
         .get("byproducts")
         .map(extract_string_tokens)
@@ -1253,6 +1586,37 @@ fn add_recipe_fields(
                     "uncraft_uses"
                 } else {
                     "used_by_recipe"
+                }
+                .to_string(),
+                format!("{recipe_name} -> {result}"),
+            ));
+        }
+    }
+
+    for tool in tools.iter().filter(|tool| index.contains_key(*tool)) {
+        if let Some(target) = index.get(tool).and_then(|idx| entries.get_mut(*idx)) {
+            target.fields.push((
+                if uncraft {
+                    "tool_for_uncraft"
+                } else {
+                    "tool_for_recipe"
+                }
+                .to_string(),
+                format!("{recipe_name} -> {result}"),
+            ));
+        }
+    }
+
+    for byproduct in byproducts
+        .iter()
+        .filter(|byproduct| index.contains_key(*byproduct))
+    {
+        if let Some(target) = index.get(byproduct).and_then(|idx| entries.get_mut(*idx)) {
+            target.fields.push((
+                if uncraft {
+                    "byproduct_of_uncraft"
+                } else {
+                    "byproduct_of_recipe"
                 }
                 .to_string(),
                 format!("{recipe_name} -> {result}"),
@@ -1328,6 +1692,14 @@ fn is_relation_field(key: &str) -> bool {
             | "used_by_recipe"
             | "uncraft_from"
             | "uncraft_uses"
+            | "tool_for_recipe"
+            | "tool_for_uncraft"
+            | "byproduct_of_recipe"
+            | "byproduct_of_uncraft"
+            | "ammo_used_by"
+            | "magazine_for"
+            | "ammo_contained_by"
+            | "contains_ammo"
             | "found_in_group"
             | "monster_source"
             | "monster_group"
@@ -1498,7 +1870,20 @@ mod tests {
                     "type":"GENERIC",
                     "id":"hiking_pack",
                     "name":"hiking pack",
-                    "pocket_data":[{"pocket_type":"CONTAINER","max_contains_volume":"20 L"}],
+                    "pocket_data":[
+                        {
+                            "pocket_type":"CONTAINER",
+                            "max_contains_volume":"20 L",
+                            "max_contains_weight":"5 kg",
+                            "max_item_length":"1 m",
+                            "moves":100,
+                            "rigid":true
+                        },
+                        {
+                            "pocket_type":"MAGAZINE",
+                            "ammo_restriction":{"9mm":15}
+                        }
+                    ],
                     "relative":{"weight":"80 g"},
                     "delete":{"flags":["OLD_FLAG"]},
                     "extend":{"flags":["NEW_FLAG"]}
@@ -1514,6 +1899,18 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "pocket_data" && value.contains("20 L"))
         );
+        assert!(pack.fields.iter().any(|(key, value)| {
+            key == "pocket_summary"
+                && value.contains("CONTAINER")
+                && value.contains("volume: 20 L")
+                && value.contains("weight: 5 kg")
+                && value.contains("length: 1 m")
+                && value.contains("moves: 100")
+                && value.contains("rigid: true")
+        }));
+        assert!(pack.fields.iter().any(|(key, value)| {
+            key == "pocket_summary" && value.contains("MAGAZINE") && value.contains("ammo: 9mm")
+        }));
         assert!(
             pack.fields
                 .iter()
@@ -1530,6 +1927,8 @@ mod tests {
                 .any(|(key, value)| key == "extend" && value.contains("NEW_FLAG"))
         );
         assert_eq!(search_dataset(&dataset, "pocket_data", 10).len(), 1);
+        assert_eq!(search_dataset(&dataset, "pocket_summary", 10).len(), 1);
+        assert_eq!(search_dataset(&dataset, "9mm", 10).len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1702,7 +2101,16 @@ mod tests {
             r#"[
                 {"type":"GENERIC","id":"long_pole","name":"long pole"},
                 {"type":"GENERIC","id":"stick_long","name":"long stick"},
-                {"type":"recipe","result":"long_pole","components":[[["stick_long",1]]],"time":"10 m"}
+                {"type":"GENERIC","id":"wood_splinter","name":"wood splinter"},
+                {"type":"TOOL","id":"hammer","name":"hammer"},
+                {
+                    "type":"recipe",
+                    "result":"long_pole",
+                    "components":[[["stick_long",1]]],
+                    "tools":[[["hammer",1]]],
+                    "byproducts":[["wood_splinter",1]],
+                    "time":"10 m"
+                }
             ]"#,
         )
         .expect("all cache");
@@ -1739,6 +2147,65 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "used_by_recipe" && value.contains("long_pole"))
         );
+        let hammer = dataset.get("hammer").expect("hammer");
+        assert!(hammer.fields.iter().any(|(key, value)| {
+            key == "tool_for_recipe" && value == "recipe/long_pole -> long_pole"
+        }));
+        let splinter = dataset.get("wood_splinter").expect("splinter");
+        assert!(splinter.fields.iter().any(|(key, value)| {
+            key == "byproduct_of_recipe" && value == "recipe/long_pole -> long_pole"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_expands_recipe_requirements() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-requirement-test-{}",
+            std::process::id()
+        ));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"GENERIC","id":"stick_long","name":"long stick"},
+                {"type":"GENERIC","id":"rag","name":"rag"},
+                {"type":"TOOL","id":"hammer","name":"hammer"},
+                {"type":"requirement","id":"req_binding","components":[[["rag",1]]]},
+                {"type":"requirement","id":"req_pole_parts","components":[[["stick_long",1]]],"tools":[[["hammer",1]]]},
+                {"type":"requirement","id":"req_full_pole","using":[["req_pole_parts",1],["req_binding",1]]},
+                {"type":"recipe","result":"long_pole","using":[["req_full_pole",1]],"time":"10 m"}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = dataset.get("long_pole").expect("long pole");
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "crafted_by"
+                && value.contains("stick_long")
+                && value.contains("rag")
+                && value.contains("hammer")
+                && value.contains("recipe/long_pole")
+        }));
+
+        let stick = dataset.get("stick_long").expect("stick");
+        assert!(stick.fields.iter().any(|(key, value)| {
+            key == "used_by_recipe" && value == "recipe/long_pole -> long_pole"
+        }));
+        let rag = dataset.get("rag").expect("rag");
+        assert!(rag.fields.iter().any(|(key, value)| {
+            key == "used_by_recipe" && value == "recipe/long_pole -> long_pole"
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1773,6 +2240,105 @@ mod tests {
             pole.fields
                 .iter()
                 .any(|(key, value)| { key == "found_in_group" && value.contains("tools_common") })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_expands_nested_item_group_relationships() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-nested-group-test-{}",
+            std::process::id()
+        ));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"item_group","id":"tools_poles","subtype":"collection","items":[["long_pole", 25]]},
+                {"type":"item_group","id":"garage_tools","subtype":"distribution","items":[["tools_poles", 100]]}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = dataset.get("long_pole").expect("long pole");
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "found_in_group" && value == "tools_poles (collection)"
+        }));
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "found_in_group" && value == "garage_tools (distribution) via tools_poles"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_adds_ammo_and_magazine_relationships() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-ammo-test-{}", std::process::id()));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"AMMO","id":"9mm","name":"9mm"},
+                {
+                    "type":"MAGAZINE",
+                    "id":"glockmag",
+                    "name":"Glock magazine",
+                    "pocket_data":[{"pocket_type":"MAGAZINE","ammo_restriction":{"9mm":15}}]
+                },
+                {
+                    "type":"GUN",
+                    "id":"glock",
+                    "name":"Glock",
+                    "ammo":"9mm",
+                    "magazines":[["glockmag"]]
+                }
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let ammo = dataset.get("9mm").expect("9mm");
+        assert!(
+            ammo.fields
+                .iter()
+                .any(|(key, value)| key == "ammo_used_by" && value == "glock")
+        );
+        assert!(
+            ammo.fields
+                .iter()
+                .any(|(key, value)| key == "ammo_contained_by" && value == "glockmag")
+        );
+
+        let magazine = dataset.get("glockmag").expect("magazine");
+        assert!(
+            magazine
+                .fields
+                .iter()
+                .any(|(key, value)| key == "magazine_for" && value == "glock")
+        );
+        assert!(
+            magazine
+                .fields
+                .iter()
+                .any(|(key, value)| key == "contains_ammo" && value == "9mm")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1823,6 +2389,40 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "monster_group" && value == "GROUP_ZOMBIE")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_derives_relationships_from_resolved_copy_from() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-derived-inherit-test-{}",
+            std::process::id()
+        ));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"item_group","id":"zombie_drops","items":[["long_pole", 10]]},
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"MONSTER","abstract":"base_zombie","id":"base_zombie","death_drops":"zombie_drops"},
+                {"type":"MONSTER","id":"mon_zombie","copy-from":"base_zombie","name":"zombie"}
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let group = dataset.get("zombie_drops").expect("drop group");
+        assert!(group.fields.iter().any(|(key, value)| {
+            key == "monster_source" && value == "mon_zombie via death_drops"
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

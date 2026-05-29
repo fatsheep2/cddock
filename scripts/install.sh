@@ -264,15 +264,16 @@ install_binary() {
   archive="${tmp}/cddock.tar.gz"
   msg "正在下载 ${APP_NAME}：${url}" \
     "Downloading ${APP_NAME}: ${url}"
-  if ! curl -fsSL "$url" -o "$archive"; then
-    if [[ -z "$fallback_url" ]]; then
-      msg "下载失败。请确认该版本已发布当前平台安装包。" \
-        "Download failed. Make sure this version has a release package for the current platform."
-      exit 1
+  if [[ -n "$fallback_url" ]]; then
+    if ! curl -fsSL "$url" -o "$archive" 2>/dev/null; then
+      msg "latest 安装包不可用，改用 dev-snapshot：${fallback_url}" \
+        "The latest package was unavailable; trying dev-snapshot: ${fallback_url}"
+      curl -fsSL "$fallback_url" -o "$archive"
     fi
-    msg "latest 安装包不可用，改用 dev-snapshot：${fallback_url}" \
-      "The latest package was unavailable; trying dev-snapshot: ${fallback_url}"
-    curl -fsSL "$fallback_url" -o "$archive"
+  elif ! curl -fsSL "$url" -o "$archive"; then
+    msg "下载失败。请确认该版本已发布当前平台安装包。" \
+      "Download failed. Make sure this version has a release package for the current platform."
+    exit 1
   fi
   tar -xzf "$archive" -C "$tmp"
   binary="$(find "$tmp" -type f -name cddock | head -n 1)"
