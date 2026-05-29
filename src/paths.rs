@@ -228,11 +228,40 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
         let dst_path = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir_all(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.exists() || dst.symlink_metadata().is_ok() {
+        fs::remove_file(dst)?;
+    }
+    std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+}
+
+#[cfg(windows)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.exists() || dst.symlink_metadata().is_ok() {
+        let metadata = dst.symlink_metadata()?;
+        if metadata.is_dir() {
+            fs::remove_dir(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    let target = fs::read_link(src)?;
+    let metadata = src.metadata()?;
+    if metadata.is_dir() {
+        std::os::windows::fs::symlink_dir(target, dst)
+    } else {
+        std::os::windows::fs::symlink_file(target, dst)
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +273,33 @@ mod tests {
         let root = PathBuf::from("/tmp/cddock-test");
         assert_eq!(userdata_dir(&root, "stable"), root.join("userdata"));
         assert_eq!(userdata_dir(&root, "experimental"), root.join("userdata"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_all_preserves_directory_symlinks() {
+        let root = std::env::temp_dir().join(format!("cddock-copy-test-{}", std::process::id()));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(src.join("Versions").join("A")).expect("src dirs");
+        fs::write(src.join("Versions").join("A").join("lib.dylib"), "test").expect("file");
+        std::os::unix::fs::symlink("A", src.join("Versions").join("Current")).expect("symlink");
+
+        copy_dir_all(&src, &dst).expect("copy dir");
+
+        let copied = dst.join("Versions").join("Current");
+        assert!(
+            copied
+                .symlink_metadata()
+                .expect("metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(copied).expect("read link"),
+            PathBuf::from("A")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
