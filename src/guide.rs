@@ -169,12 +169,16 @@ pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<
         return Vec::new();
     }
     let query = query.to_lowercase();
+    let terms = query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
     let mut matches = dataset
         .entries
         .iter()
         .enumerate()
         .filter_map(|(index, result)| {
-            search_score(result, &query).map(|score| (score, index, result))
+            search_score(result, &query, &terms).map(|score| (score, index, result))
         })
         .collect::<Vec<_>>();
     matches.sort_by_key(|(score, index, _)| (*score, *index));
@@ -185,7 +189,51 @@ pub fn search_dataset(dataset: &GuideDataset, query: &str, limit: usize) -> Vec<
         .collect()
 }
 
-fn search_score(result: &GuideSearchResult, query: &str) -> Option<usize> {
+fn search_score(result: &GuideSearchResult, query: &str, terms: &[&str]) -> Option<usize> {
+    let id = result.id.to_lowercase();
+    let kind = result.kind.to_lowercase();
+    let name = result.name.to_lowercase();
+    let description = result.description.to_lowercase();
+    if id == query {
+        return Some(0);
+    }
+    if id.starts_with(query) {
+        return Some(10);
+    }
+    if name == query {
+        return Some(20);
+    }
+    if name.starts_with(query) {
+        return Some(30);
+    }
+    if id.contains(query) {
+        return Some(40);
+    }
+    if name.contains(query) {
+        return Some(50);
+    }
+    if kind.contains(query) {
+        return Some(60);
+    }
+    if description.contains(query) {
+        return Some(70);
+    }
+    if result.fields.iter().any(|(key, value)| {
+        key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+    }) {
+        return Some(80);
+    }
+    if terms.len() > 1 {
+        let mut total = 0;
+        for term in terms {
+            total += search_term_score(result, term)?;
+        }
+        return Some(100 + total);
+    }
+    None
+}
+
+fn search_term_score(result: &GuideSearchResult, query: &str) -> Option<usize> {
     let id = result.id.to_lowercase();
     let kind = result.kind.to_lowercase();
     let name = result.name.to_lowercase();
@@ -261,11 +309,30 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
     let preview_dir = guide_cache_dir(game_root)
         .join("tiles")
         .join(safe_file_name(&result.id));
-    let matches = find_tile_matches(&build_path, &result.id, &preview_dir);
+    let mut matches = Vec::new();
+    for candidate in tile_lookup_ids(result) {
+        let candidate_matches = find_tile_matches(&build_path, &candidate, &preview_dir);
+        for item in candidate_matches {
+            let item = if candidate == result.id {
+                item
+            } else {
+                format!("matched_id: {candidate}; {item}")
+            };
+            if !matches.contains(&item) {
+                matches.push(item);
+            }
+        }
+        if !matches.is_empty() {
+            break;
+        }
+    }
     if matches.is_empty() {
         result.fields.push((
             "tile_match".to_string(),
-            "no local tileset entry found under active build gfx/".to_string(),
+            format!(
+                "no local tileset entry found for {} or looks_like ids under active build gfx/",
+                result.id
+            ),
         ));
         return;
     }
@@ -273,6 +340,20 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
     for item in matches.into_iter().take(6) {
         result.fields.push(("tile_match".to_string(), item));
     }
+}
+
+fn tile_lookup_ids(result: &GuideSearchResult) -> Vec<String> {
+    let mut ids = vec![result.id.clone()];
+    for (key, value) in &result.fields {
+        if matches!(key.as_str(), "looks_like" | "fallback") {
+            for candidate in extract_relation_ids(value) {
+                if !ids.contains(&candidate) {
+                    ids.push(candidate);
+                }
+            }
+        }
+    }
+    ids
 }
 
 fn find_tile_matches(build_path: &Path, id: &str, preview_dir: &Path) -> Vec<String> {
@@ -407,10 +488,7 @@ fn tile_match_summary(
         let sheet_path = tileset_dir.join(sheet);
         if let Some((image_width, image_height)) = png_dimensions(&sheet_path) {
             let columns = (image_width / tile_width).max(1);
-            for key in ["fg", "bg"] {
-                let Some(tile_id) = map.get(key).and_then(first_tile_sprite_index) else {
-                    continue;
-                };
+            for (key, tile_id) in tile_sprite_layers(map) {
                 let x = (tile_id % columns) * tile_width;
                 let y = (tile_id / columns) * tile_height;
                 parts.push(format!("{key}_crop: {x},{y} {tile_width}x{tile_height}"));
@@ -427,7 +505,7 @@ fn tile_match_summary(
                     preview_dir,
                     tileset,
                     sheet,
-                    key,
+                    &key,
                     x,
                     y,
                     tile_width,
@@ -439,6 +517,46 @@ fn tile_match_summary(
         }
     }
     parts.join("; ")
+}
+
+fn tile_sprite_layers(map: &Map<String, Value>) -> Vec<(String, u32)> {
+    let mut layers = Vec::new();
+    for key in ["fg", "bg"] {
+        if let Some(tile_id) = map.get(key).and_then(first_tile_sprite_index) {
+            layers.push((key.to_string(), tile_id));
+        }
+    }
+    if let Some(additional) = map.get("additional_tiles") {
+        collect_additional_tile_layers(additional, &mut layers);
+    }
+    layers
+}
+
+fn collect_additional_tile_layers(value: &Value, layers: &mut Vec<(String, u32)>) {
+    match value {
+        Value::Array(values) => {
+            for child in values {
+                collect_additional_tile_layers(child, layers);
+            }
+        }
+        Value::Object(map) => {
+            let suffix = map
+                .get("id")
+                .and_then(|value| compact_value(value, &HashMap::new()))
+                .unwrap_or_else(|| "additional".to_string());
+            for key in ["fg", "bg"] {
+                if let Some(tile_id) = map.get(key).and_then(first_tile_sprite_index) {
+                    layers.push((format!("additional_{suffix}_{key}"), tile_id));
+                }
+            }
+            for child in map.values() {
+                if child.is_object() || child.is_array() {
+                    collect_additional_tile_layers(child, layers);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn first_tile_sprite_index(value: &Value) -> Option<u32> {
@@ -903,7 +1021,9 @@ fn object_to_result(
         "dispersion",
         "recoil",
         "damage",
+        "melee_damage",
         "to_hit",
+        "attack_cost",
         "bashing",
         "cutting",
         "qualities",
@@ -950,8 +1070,141 @@ fn object_to_result(
     for key in PRIMARY_FIELDS {
         add_compact_field(&mut fields, map, key, translations);
     }
+    for summary in use_action_summaries(map.get("use_action"), translations) {
+        fields.push(("use_action_summary".to_string(), summary));
+    }
     for summary in pocket_summaries(map.get("pocket_data"), translations) {
         fields.push(("pocket_summary".to_string(), summary));
+    }
+    for summary in object_section_summaries(
+        map.get("armor_data"),
+        translations,
+        "armor",
+        &[
+            ("encumbrance", "enc"),
+            ("coverage", "coverage"),
+            ("covers", "covers"),
+            ("material_thickness", "thickness"),
+            ("env_protec", "env"),
+            ("warmth", "warmth"),
+            ("storage", "storage"),
+        ],
+    ) {
+        fields.push(("armor_summary".to_string(), summary));
+    }
+    for summary in object_section_summaries(
+        map.get("gun_data"),
+        translations,
+        "gun",
+        &[
+            ("ammo", "ammo"),
+            ("skill", "skill"),
+            ("range", "range"),
+            ("ranged_damage", "damage"),
+            ("dispersion", "dispersion"),
+            ("durability", "durability"),
+            ("min_cycle_recoil", "cycle recoil"),
+            ("modes", "modes"),
+        ],
+    ) {
+        fields.push(("gun_summary".to_string(), summary));
+    }
+    if let Some(summary) = object_section_summary(
+        &Value::Object(map.clone()),
+        translations,
+        "melee",
+        &[
+            ("melee_damage", "damage"),
+            ("to_hit", "to hit"),
+            ("attack_cost", "attack cost"),
+            ("bashing", "bash"),
+            ("cutting", "cut"),
+            ("techniques", "techniques"),
+        ],
+    ) {
+        if summary != "melee" && summary.contains(":") {
+            fields.push(("melee_summary".to_string(), summary));
+        }
+    }
+    for summary in object_section_summaries(
+        map.get("tool_data"),
+        translations,
+        "tool",
+        &[
+            ("ammo", "ammo"),
+            ("max_charges", "max charges"),
+            ("initial_charges", "initial charges"),
+            ("charges_per_use", "charges/use"),
+            ("turns_per_charge", "turns/charge"),
+            ("revert_to", "reverts to"),
+            ("subtype", "subtype"),
+        ],
+    ) {
+        fields.push(("tool_summary".to_string(), summary));
+    }
+    for summary in object_section_summaries(
+        map.get("magazine_data"),
+        translations,
+        "magazine",
+        &[
+            ("ammo_type", "ammo"),
+            ("capacity", "capacity"),
+            ("reload_time", "reload time"),
+            ("linkage", "linkage"),
+            ("count", "count"),
+        ],
+    ) {
+        fields.push(("magazine_summary".to_string(), summary));
+    }
+    for summary in object_section_summaries(
+        map.get("book_data"),
+        translations,
+        "book",
+        &[
+            ("skill", "skill"),
+            ("required_level", "required"),
+            ("max_level", "max"),
+            ("intelligence", "int"),
+            ("time", "time"),
+            ("fun", "fun"),
+            ("chapters", "chapters"),
+        ],
+    ) {
+        fields.push(("book_summary".to_string(), summary));
+    }
+    if let Some(summary) = object_section_summary(
+        &Value::Object(map.clone()),
+        translations,
+        "comestible",
+        &[
+            ("comestible_type", "type"),
+            ("calories", "calories"),
+            ("quench", "quench"),
+            ("healthy", "healthy"),
+            ("fun", "fun"),
+            ("spoils_in", "spoils in"),
+            ("addiction_type", "addiction"),
+            ("vitamins", "vitamins"),
+        ],
+    ) {
+        if summary != "comestible" && summary.contains(":") {
+            fields.push(("comestible_summary".to_string(), summary));
+        }
+    }
+    for summary in object_section_summaries(
+        map.get("seed_data"),
+        translations,
+        "seed",
+        &[
+            ("plant_name", "plant"),
+            ("fruit", "fruit"),
+            ("byproducts", "byproducts"),
+            ("grow", "grow"),
+            ("fruit_div", "fruit div"),
+            ("required_terrain", "terrain"),
+        ],
+    ) {
+        fields.push(("seed_summary".to_string(), summary));
     }
     let mut extra_keys = map.keys().map(String::as_str).collect::<Vec<_>>();
     extra_keys.sort_unstable();
@@ -1000,6 +1253,61 @@ fn add_compact_field(
         .and_then(|value| compact_value(value, translations))
     {
         fields.push((key.to_string(), value));
+    }
+}
+
+fn use_action_summaries(
+    value: Option<&Value>,
+    translations: &HashMap<String, String>,
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| use_action_summary(value, translations))
+            .collect(),
+        Value::Object(_) | Value::String(_) => use_action_summary(value, translations)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn use_action_summary(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
+    let Value::Object(map) = value else {
+        return compact_value(value, translations).map(|value| format!("action: {value}"));
+    };
+    let mut parts = Vec::new();
+    let label = map
+        .get("type")
+        .or_else(|| map.get("action"))
+        .and_then(|value| compact_value(value, translations))
+        .unwrap_or_else(|| "action".to_string());
+    parts.push(label);
+
+    for (key, label) in [
+        ("target", "target"),
+        ("menu_text", "menu"),
+        ("msg", "msg"),
+        ("active", "active"),
+        ("need_charges", "needs charges"),
+        ("charges_to_use", "charges/use"),
+        ("moves", "moves"),
+        ("transform_age", "age"),
+        ("not_ready_msg", "not ready"),
+    ] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+
+    let summary = parts.join("; ");
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
     }
 }
 
@@ -1061,6 +1369,59 @@ fn pocket_summary(value: &Value, translations: &HashMap<String, String>) -> Opti
     }
 }
 
+fn object_section_summaries(
+    value: Option<&Value>,
+    translations: &HashMap<String, String>,
+    fallback_label: &str,
+    keys: &[(&str, &str)],
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| object_section_summary(value, translations, fallback_label, keys))
+            .collect(),
+        Value::Object(_) => object_section_summary(value, translations, fallback_label, keys)
+            .into_iter()
+            .collect(),
+        _ => compact_value(value, translations).into_iter().collect(),
+    }
+}
+
+fn object_section_summary(
+    value: &Value,
+    translations: &HashMap<String, String>,
+    fallback_label: &str,
+    keys: &[(&str, &str)],
+) -> Option<String> {
+    let Value::Object(map) = value else {
+        return compact_value(value, translations);
+    };
+    let mut parts = Vec::new();
+    let label = map
+        .get("material")
+        .or_else(|| map.get("id"))
+        .or_else(|| map.get("type"))
+        .and_then(|value| compact_value(value, translations))
+        .unwrap_or_else(|| fallback_label.to_string());
+    parts.push(label);
+
+    for (key, label) in keys {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+
+    let summary = parts.join("; ");
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
 fn add_derived_fields(
     objects: &[Map<String, Value>],
     entries: &mut [GuideSearchResult],
@@ -1073,6 +1434,8 @@ fn add_derived_fields(
 
     let group_index = item_group_index(objects, translations);
     let requirement_index = requirement_index(objects, translations);
+    let quality_index = quality_index(objects, translations);
+    let harvest_sources = harvest_source_index(objects, translations);
     for map in objects {
         let kind = map
             .get("type")
@@ -1084,15 +1447,32 @@ fn add_derived_fields(
                 entries,
                 &index,
                 &requirement_index,
+                &quality_index,
                 translations,
                 false,
             ),
-            "uncraft" => {
-                add_recipe_fields(map, entries, &index, &requirement_index, translations, true)
-            }
+            "uncraft" => add_recipe_fields(
+                map,
+                entries,
+                &index,
+                &requirement_index,
+                &quality_index,
+                translations,
+                true,
+            ),
             "item_group" => add_item_group_fields(map, entries, &index, &group_index, translations),
             "MONSTER" => add_monster_fields(map, entries, &index, translations),
             "monstergroup" => add_monster_group_fields(map, entries, &index, translations),
+            "construction" => add_construction_fields(
+                map,
+                entries,
+                &index,
+                &requirement_index,
+                &quality_index,
+                translations,
+            ),
+            "vehicle_part" => add_vehicle_part_fields(map, entries, &index, translations),
+            "harvest" => add_harvest_fields(map, entries, &index, &harvest_sources, translations),
             _ => {}
         }
         add_ammo_magazine_fields(map, entries, &index, translations);
@@ -1177,6 +1557,72 @@ fn requirement_parts(map: &Map<String, Value>) -> RequirementParts {
     }
 }
 
+fn quality_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, Vec<String>> {
+    let mut qualities: HashMap<String, Vec<String>> = HashMap::new();
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        let Some(item_id) = object_identity_id(map, &kind, translations) else {
+            continue;
+        };
+        for quality in map
+            .get("qualities")
+            .map(extract_string_tokens)
+            .unwrap_or_default()
+        {
+            let items = qualities.entry(quality).or_default();
+            if !items.contains(&item_id) {
+                items.push(item_id.clone());
+            }
+        }
+    }
+    for items in qualities.values_mut() {
+        items.sort();
+    }
+    qualities
+}
+
+fn harvest_source_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, Vec<String>> {
+    let mut sources: HashMap<String, Vec<String>> = HashMap::new();
+    for map in objects {
+        let kind = map
+            .get("type")
+            .and_then(|value| compact_value(value, translations))
+            .unwrap_or_default();
+        if kind != "MONSTER" {
+            continue;
+        }
+        let Some(monster_id) = map
+            .get("id")
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        let Some(harvest_id) = map
+            .get("harvest")
+            .and_then(|value| compact_value(value, translations))
+        else {
+            continue;
+        };
+        let monsters = sources.entry(harvest_id).or_default();
+        if !monsters.contains(&monster_id) {
+            monsters.push(monster_id);
+        }
+    }
+    for monsters in sources.values_mut() {
+        monsters.sort();
+    }
+    sources
+}
+
 fn expand_requirement_parts(
     requirement_id: &str,
     requirement_index: &HashMap<String, RequirementParts>,
@@ -1249,7 +1695,20 @@ fn add_cross_reference_fields(
                     .fields
                     .push(("referenced_by".to_string(), source_label.clone()));
             }
+            if let Some(relation_key) = source_reference_relation_key(&kind) {
+                push_relation(entries, index, &token, relation_key, &source_label);
+            }
         }
+    }
+}
+
+fn source_reference_relation_key(kind: &str) -> Option<&'static str> {
+    match kind {
+        "mapgen" | "mapgen_palette" => Some("placed_by_mapgen"),
+        "map_extra" => Some("placed_by_map_extra"),
+        "overmap_special" => Some("placed_by_overmap_special"),
+        "effect_on_condition" => Some("referenced_by_eoc"),
+        _ => None,
     }
 }
 
@@ -1360,6 +1819,174 @@ fn add_ammo_magazine_fields(
         push_relation(entries, index, ammo, "ammo_contained_by", &source_id);
         push_relation(entries, index, &source_id, "contains_ammo", ammo);
     }
+}
+
+fn add_construction_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    requirement_index: &HashMap<String, RequirementParts>,
+    quality_index: &HashMap<String, Vec<String>>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(construction_id) = map
+        .get("id")
+        .or_else(|| map.get("group"))
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let label = construction_summary(map, &construction_id, translations);
+    let mut components = map
+        .get("components")
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    let mut tools = map
+        .get("tools")
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    for requirement_id in map
+        .get("using")
+        .map(extract_string_tokens)
+        .unwrap_or_default()
+    {
+        let mut seen = HashSet::new();
+        let requirement =
+            expand_requirement_parts(&requirement_id, requirement_index, &mut seen, 0);
+        components.extend(requirement.components);
+        tools.extend(requirement.tools);
+    }
+    components.sort();
+    components.dedup();
+    tools.sort();
+    tools.dedup();
+
+    for component in components.iter().filter(|item| index.contains_key(*item)) {
+        push_relation(entries, index, component, "used_in_construction", &label);
+    }
+    for tool in tools.iter().filter(|item| index.contains_key(*item)) {
+        push_relation(entries, index, tool, "tool_for_construction", &label);
+    }
+    for quality in tools.iter().filter(|quality| !index.contains_key(*quality)) {
+        for item_id in quality_index.get(quality).into_iter().flatten() {
+            push_relation(
+                entries,
+                index,
+                item_id,
+                "tool_for_construction",
+                &format!("{label}; quality: {quality}"),
+            );
+        }
+    }
+}
+
+fn construction_summary(
+    map: &Map<String, Value>,
+    construction_id: &str,
+    translations: &HashMap<String, String>,
+) -> String {
+    let mut parts = vec![format!("construction:{construction_id}")];
+    for (key, label) in [
+        ("pre_terrain", "from"),
+        ("post_terrain", "to"),
+        ("time", "time"),
+        ("difficulty", "difficulty"),
+    ] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.join("; ")
+}
+
+fn add_vehicle_part_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(part_id) = map
+        .get("id")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let Some(item_id) = map
+        .get("item")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let label = vehicle_part_summary(map, &part_id, translations);
+    push_relation(
+        entries,
+        index,
+        &item_id,
+        "installed_as_vehicle_part",
+        &label,
+    );
+}
+
+fn vehicle_part_summary(
+    map: &Map<String, Value>,
+    part_id: &str,
+    translations: &HashMap<String, String>,
+) -> String {
+    let mut parts = vec![format!("vehicle_part:{part_id}")];
+    for (key, label) in [
+        ("location", "location"),
+        ("durability", "durability"),
+        ("damage_modifier", "damage mod"),
+        ("folded_volume", "folded volume"),
+        ("flags", "flags"),
+    ] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.join("; ")
+}
+
+fn add_harvest_fields(
+    map: &Map<String, Value>,
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    harvest_sources: &HashMap<String, Vec<String>>,
+    translations: &HashMap<String, String>,
+) {
+    let Some(harvest_id) = map
+        .get("id")
+        .and_then(|value| compact_value(value, translations))
+    else {
+        return;
+    };
+    let base_label = harvest_summary(map, &harvest_id, harvest_sources, translations);
+    let tokens = map
+        .get("entries")
+        .or_else(|| map.get("drops"))
+        .map(extract_string_tokens)
+        .unwrap_or_default();
+    for token in tokens.iter().filter(|token| index.contains_key(*token)) {
+        push_relation(entries, index, token, "harvested_from", &base_label);
+    }
+}
+
+fn harvest_summary(
+    map: &Map<String, Value>,
+    harvest_id: &str,
+    harvest_sources: &HashMap<String, Vec<String>>,
+    translations: &HashMap<String, String>,
+) -> String {
+    let mut parts = vec![format!("harvest:{harvest_id}")];
+    if let Some(monsters) = harvest_sources.get(harvest_id) {
+        parts.push(format!("monsters: {}", monsters.join(", ")));
+    }
+    for (key, label) in [("message", "message"), ("leftovers", "leftovers")] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.join("; ")
 }
 
 fn add_item_group_fields(
@@ -1520,6 +2147,7 @@ fn add_recipe_fields(
     entries: &mut [GuideSearchResult],
     index: &HashMap<String, usize>,
     requirement_index: &HashMap<String, RequirementParts>,
+    quality_index: &HashMap<String, Vec<String>>,
     translations: &HashMap<String, String>,
     uncraft: bool,
 ) {
@@ -1604,6 +2232,21 @@ fn add_recipe_fields(
                 .to_string(),
                 format!("{recipe_name} -> {result}"),
             ));
+        }
+    }
+    for quality in tools.iter().filter(|quality| !index.contains_key(*quality)) {
+        for item_id in quality_index.get(quality).into_iter().flatten() {
+            push_relation(
+                entries,
+                index,
+                item_id,
+                if uncraft {
+                    "tool_for_uncraft"
+                } else {
+                    "tool_for_recipe"
+                },
+                &format!("{recipe_name} -> {result}; quality: {quality}"),
+            );
         }
     }
 
@@ -1700,6 +2343,14 @@ fn is_relation_field(key: &str) -> bool {
             | "magazine_for"
             | "ammo_contained_by"
             | "contains_ammo"
+            | "used_in_construction"
+            | "tool_for_construction"
+            | "installed_as_vehicle_part"
+            | "placed_by_mapgen"
+            | "placed_by_map_extra"
+            | "placed_by_overmap_special"
+            | "referenced_by_eoc"
+            | "harvested_from"
             | "found_in_group"
             | "monster_source"
             | "monster_group"
@@ -1733,18 +2384,23 @@ fn looks_like_relation_id(value: &str) -> bool {
         "byproducts",
         "collection",
         "components",
+        "construction",
         "death_drops",
         "distribution",
         "harvest",
         "item",
         "items",
+        "map_extra",
+        "mapgen",
         "monster",
+        "overmap_special",
         "recipe",
         "result",
         "time",
         "tools",
         "type",
         "using",
+        "vehicle_part",
         "via",
     ];
     looks_like_item_id(value)
@@ -1760,8 +2416,39 @@ fn field_text(
     key: &str,
     translations: &HashMap<String, String>,
 ) -> Option<String> {
-    map.get(key)
-        .and_then(|value| compact_value(value, translations))
+    let value = map.get(key)?;
+    if key.contains("damage") {
+        if let Some(text) = damage_value_text(value, translations) {
+            return Some(text);
+        }
+    }
+    compact_value(value, translations)
+}
+
+fn damage_value_text(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
+    match value {
+        Value::Array(values) => {
+            let parts = values
+                .iter()
+                .filter_map(|value| damage_value_text(value, translations))
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        Value::Object(map) => {
+            let damage_type = map
+                .get("damage_type")
+                .and_then(|value| compact_value(value, translations))?;
+            let amount = map
+                .get("amount")
+                .and_then(|value| compact_value(value, translations))?;
+            Some(format!("{damage_type} {amount}"))
+        }
+        _ => None,
+    }
 }
 
 fn compact_value(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
@@ -1887,6 +2574,121 @@ mod tests {
                     "relative":{"weight":"80 g"},
                     "delete":{"flags":["OLD_FLAG"]},
                     "extend":{"flags":["NEW_FLAG"]}
+                },
+                {
+                    "type":"ARMOR",
+                    "id":"leather_jacket",
+                    "name":"leather jacket",
+                    "armor_data":[
+                        {
+                            "material":"leather",
+                            "covers":["torso","arm_l","arm_r"],
+                            "coverage":95,
+                            "encumbrance":12,
+                            "material_thickness":2,
+                            "env_protec":1,
+                            "warmth":20,
+                            "storage":"1 L"
+                        }
+                    ]
+                },
+                {
+                    "type":"GUN",
+                    "id":"pistol_9mm",
+                    "name":"9mm pistol",
+                    "gun_data":{
+                        "ammo":"9mm",
+                        "skill":"pistol",
+                        "range":12,
+                        "ranged_damage":{"damage_type":"bullet","amount":2},
+                        "dispersion":480,
+                        "durability":6,
+                        "min_cycle_recoil":350,
+                        "modes":[["DEFAULT","semi",1]]
+                    }
+                },
+                {
+                    "type":"GENERIC",
+                    "id":"combat_knife",
+                    "name":"combat knife",
+                    "melee_damage":[{"damage_type":"cut","amount":18},{"damage_type":"stab","amount":8}],
+                    "to_hit":1,
+                    "attack_cost":85,
+                    "techniques":["RAPID","WBLOCK_1"]
+                },
+                {
+                    "type":"TOOL",
+                    "id":"flashlight",
+                    "name":"flashlight",
+                    "tool_data":{
+                        "ammo":"battery",
+                        "max_charges":100,
+                        "initial_charges":20,
+                        "charges_per_use":1,
+                        "turns_per_charge":1,
+                        "revert_to":"flashlight_off",
+                        "subtype":"battery"
+                    },
+                    "use_action":{
+                        "type":"transform",
+                        "target":"flashlight_on",
+                        "menu_text":"Turn on",
+                        "msg":"The flashlight turns on.",
+                        "need_charges":1,
+                        "charges_to_use":1,
+                        "moves":100
+                    }
+                },
+                {
+                    "type":"MAGAZINE",
+                    "id":"glockmag",
+                    "name":"Glock magazine",
+                    "magazine_data":{
+                        "ammo_type":"9mm",
+                        "capacity":15,
+                        "reload_time":100,
+                        "linkage":"linkage_9mm"
+                    }
+                },
+                {
+                    "type":"BOOK",
+                    "id":"manual_mechanics",
+                    "name":"mechanics manual",
+                    "book_data":{
+                        "skill":"mechanics",
+                        "required_level":1,
+                        "max_level":3,
+                        "intelligence":8,
+                        "time":"30 m",
+                        "fun":1,
+                        "chapters":10
+                    }
+                },
+                {
+                    "type":"COMESTIBLE",
+                    "id":"aspirin",
+                    "name":"aspirin",
+                    "comestible_type":"MED",
+                    "calories":0,
+                    "quench":0,
+                    "healthy":-1,
+                    "fun":0,
+                    "spoils_in":"never",
+                    "addiction_type":"none",
+                    "vitamins":[["vitC", 1]]
+                },
+                {
+                    "type":"GENERIC",
+                    "id":"seed_corn",
+                    "name":"corn seed",
+                    "seed_data":{
+                        "plant_name":"corn",
+                        "fruit":"corn",
+                        "byproducts":["straw_pile"],
+                        "grow":"91 days",
+                        "fruit_div":2,
+                        "required_terrain":"t_dirt"
+                    }
                 }
             ]"#,
         )
@@ -1928,7 +2730,120 @@ mod tests {
         );
         assert_eq!(search_dataset(&dataset, "pocket_data", 10).len(), 1);
         assert_eq!(search_dataset(&dataset, "pocket_summary", 10).len(), 1);
-        assert_eq!(search_dataset(&dataset, "9mm", 10).len(), 1);
+        assert_eq!(search_dataset(&dataset, "pocket_summary 9mm", 10).len(), 1);
+        assert!(
+            search_dataset(&dataset, "9mm", 10)
+                .iter()
+                .any(|result| result.id == "hiking_pack")
+        );
+
+        let armor = dataset.get("leather_jacket").expect("armor");
+        assert!(armor.fields.iter().any(|(key, value)| {
+            key == "armor_summary"
+                && value.contains("leather")
+                && value.contains("enc: 12")
+                && value.contains("coverage: 95")
+                && value.contains("covers: torso, arm_l, arm_r")
+                && value.contains("thickness: 2")
+                && value.contains("env: 1")
+                && value.contains("storage: 1 L")
+        }));
+        let gun = dataset.get("pistol_9mm").expect("gun");
+        assert!(gun.fields.iter().any(|(key, value)| {
+            key == "gun_summary"
+                && value.contains("ammo: 9mm")
+                && value.contains("skill: pistol")
+                && value.contains("range: 12")
+                && value.contains("dispersion: 480")
+                && value.contains("cycle recoil: 350")
+        }));
+        assert_eq!(search_dataset(&dataset, "armor_summary torso", 10).len(), 1);
+        assert_eq!(search_dataset(&dataset, "gun_summary pistol", 10).len(), 1);
+
+        let knife = dataset.get("combat_knife").expect("knife");
+        assert!(knife.fields.iter().any(|(key, value)| {
+            key == "melee_summary"
+                && value.contains("damage: cut 18, stab 8")
+                && value.contains("to hit: 1")
+                && value.contains("attack cost: 85")
+                && value.contains("techniques: RAPID, WBLOCK_1")
+        }));
+        assert_eq!(search_dataset(&dataset, "melee_summary RAPID", 10).len(), 1);
+
+        let tool = dataset.get("flashlight").expect("tool");
+        assert!(tool.fields.iter().any(|(key, value)| {
+            key == "use_action_summary"
+                && value.contains("transform")
+                && value.contains("target: flashlight_on")
+                && value.contains("menu: Turn on")
+                && value.contains("needs charges: 1")
+                && value.contains("moves: 100")
+        }));
+        assert!(tool.fields.iter().any(|(key, value)| {
+            key == "tool_summary"
+                && value.contains("ammo: battery")
+                && value.contains("max charges: 100")
+                && value.contains("initial charges: 20")
+                && value.contains("charges/use: 1")
+                && value.contains("reverts to: flashlight_off")
+        }));
+        let magazine = dataset.get("glockmag").expect("magazine");
+        assert!(magazine.fields.iter().any(|(key, value)| {
+            key == "magazine_summary"
+                && value.contains("ammo: 9mm")
+                && value.contains("capacity: 15")
+                && value.contains("reload time: 100")
+                && value.contains("linkage: linkage_9mm")
+        }));
+        let book = dataset.get("manual_mechanics").expect("book");
+        assert!(book.fields.iter().any(|(key, value)| {
+            key == "book_summary"
+                && value.contains("skill: mechanics")
+                && value.contains("required: 1")
+                && value.contains("max: 3")
+                && value.contains("int: 8")
+                && value.contains("chapters: 10")
+        }));
+        assert_eq!(
+            search_dataset(&dataset, "tool_summary battery", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "magazine_summary capacity", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "book_summary mechanics", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "use_action_summary flashlight_on", 10).len(),
+            1
+        );
+
+        let aspirin = dataset.get("aspirin").expect("aspirin");
+        assert!(aspirin.fields.iter().any(|(key, value)| {
+            key == "comestible_summary"
+                && value.contains("type: MED")
+                && value.contains("healthy: -1")
+                && value.contains("spoils in: never")
+                && value.contains("addiction: none")
+                && value.contains("vitamins: vitC, 1")
+        }));
+        let seed = dataset.get("seed_corn").expect("seed");
+        assert!(seed.fields.iter().any(|(key, value)| {
+            key == "seed_summary"
+                && value.contains("plant: corn")
+                && value.contains("fruit: corn")
+                && value.contains("byproducts: straw_pile")
+                && value.contains("grow: 91 days")
+                && value.contains("terrain: t_dirt")
+        }));
+        assert_eq!(
+            search_dataset(&dataset, "comestible_summary MED", 10).len(),
+            1
+        );
+        assert_eq!(search_dataset(&dataset, "seed_summary corn", 10).len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2102,12 +3017,12 @@ mod tests {
                 {"type":"GENERIC","id":"long_pole","name":"long pole"},
                 {"type":"GENERIC","id":"stick_long","name":"long stick"},
                 {"type":"GENERIC","id":"wood_splinter","name":"wood splinter"},
-                {"type":"TOOL","id":"hammer","name":"hammer"},
+                {"type":"TOOL","id":"hammer","name":"hammer","qualities":[["HAMMER",1]]},
                 {
                     "type":"recipe",
                     "result":"long_pole",
                     "components":[[["stick_long",1]]],
-                    "tools":[[["hammer",1]]],
+                    "tools":[[["HAMMER",1]]],
                     "byproducts":[["wood_splinter",1]],
                     "time":"10 m"
                 }
@@ -2149,7 +3064,7 @@ mod tests {
         );
         let hammer = dataset.get("hammer").expect("hammer");
         assert!(hammer.fields.iter().any(|(key, value)| {
-            key == "tool_for_recipe" && value == "recipe/long_pole -> long_pole"
+            key == "tool_for_recipe" && value == "recipe/long_pole -> long_pole; quality: HAMMER"
         }));
         let splinter = dataset.get("wood_splinter").expect("splinter");
         assert!(splinter.fields.iter().any(|(key, value)| {
@@ -2179,7 +3094,7 @@ mod tests {
                 {"type":"GENERIC","id":"long_pole","name":"long pole"},
                 {"type":"GENERIC","id":"stick_long","name":"long stick"},
                 {"type":"GENERIC","id":"rag","name":"rag"},
-                {"type":"TOOL","id":"hammer","name":"hammer"},
+                {"type":"TOOL","id":"hammer","name":"hammer","qualities":[["HAMMER",1]]},
                 {"type":"requirement","id":"req_binding","components":[[["rag",1]]]},
                 {"type":"requirement","id":"req_pole_parts","components":[[["stick_long",1]]],"tools":[[["hammer",1]]]},
                 {"type":"requirement","id":"req_full_pole","using":[["req_pole_parts",1],["req_binding",1]]},
@@ -2345,6 +3260,85 @@ mod tests {
     }
 
     #[test]
+    fn load_dataset_adds_construction_and_vehicle_part_relationships() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-construction-test-{}",
+            std::process::id()
+        ));
+        let build = "0.H-RELEASE";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            r#"[{"build_number":"0.H-RELEASE","prerelease":false,"langs":["zh_CN"]}]"#,
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[
+                {"type":"GENERIC","id":"long_pole","name":"long pole"},
+                {"type":"GENERIC","id":"rag","name":"rag"},
+                {"type":"TOOL","id":"hammer","name":"hammer","qualities":[["HAMMER",1]]},
+                {"type":"GENERIC","id":"bike_wheel","name":"bike wheel"},
+                {"type":"requirement","id":"req_rack_parts","components":[[["long_pole",2],["rag",1]]],"tools":[[["HAMMER",1]]]},
+                {
+                    "type":"construction",
+                    "id":"constr_long_pole_rack",
+                    "using":[["req_rack_parts",1]],
+                    "pre_terrain":"t_floor",
+                    "post_terrain":"t_rack",
+                    "time":"20 m",
+                    "difficulty":2
+                },
+                {
+                    "type":"vehicle_part",
+                    "id":"wheel_bicycle",
+                    "name":"bicycle wheel",
+                    "item":"bike_wheel",
+                    "location":"on_roof",
+                    "durability":80,
+                    "flags":["WHEEL"]
+                }
+            ]"#,
+        )
+        .expect("all cache");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let pole = dataset.get("long_pole").expect("long pole");
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "used_in_construction"
+                && value.contains("construction:constr_long_pole_rack")
+                && value.contains("from: t_floor")
+                && value.contains("to: t_rack")
+                && value.contains("time: 20 m")
+        }));
+        let hammer = dataset.get("hammer").expect("hammer");
+        assert!(hammer.fields.iter().any(|(key, value)| {
+            key == "tool_for_construction"
+                && value.contains("construction:constr_long_pole_rack")
+                && value.contains("quality: HAMMER")
+        }));
+        let wheel = dataset.get("bike_wheel").expect("wheel");
+        assert!(wheel.fields.iter().any(|(key, value)| {
+            key == "installed_as_vehicle_part"
+                && value.contains("vehicle_part:wheel_bicycle")
+                && value.contains("location: on_roof")
+                && value.contains("durability: 80")
+                && value.contains("flags: WHEEL")
+        }));
+        assert_eq!(
+            search_dataset(&dataset, "used_in_construction rack", 10).len(),
+            2
+        );
+        assert_eq!(
+            search_dataset(&dataset, "installed_as_vehicle_part wheel", 10).len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn load_dataset_adds_monster_source_relationships() {
         let root =
             std::env::temp_dir().join(format!("cddock-guide-monster-test-{}", std::process::id()));
@@ -2361,7 +3355,9 @@ mod tests {
             r#"[
                 {"type":"item_group","id":"zombie_drops","items":[["long_pole", 10]]},
                 {"type":"GENERIC","id":"long_pole","name":"long pole"},
-                {"type":"MONSTER","id":"mon_zombie","name":"zombie","death_drops":"zombie_drops"},
+                {"type":"COMESTIBLE","id":"meat","name":"meat"},
+                {"type":"harvest","id":"zombie_harvest","entries":[{"drop":"meat","type":"flesh","mass_ratio":0.4}]},
+                {"type":"MONSTER","id":"mon_zombie","name":"zombie","death_drops":"zombie_drops","harvest":"zombie_harvest"},
                 {"type":"monstergroup","name":"GROUP_ZOMBIE","monsters":[{"monster":"mon_zombie","freq":100}]}
             ]"#,
         )
@@ -2377,6 +3373,16 @@ mod tests {
                 .fields
                 .iter()
                 .any(|(key, value)| key == "monster_source" && value.contains("mon_zombie"))
+        );
+        let meat = dataset.get("meat").expect("meat");
+        assert!(meat.fields.iter().any(|(key, value)| {
+            key == "harvested_from"
+                && value.contains("harvest:zombie_harvest")
+                && value.contains("monsters: mon_zombie")
+        }));
+        assert_eq!(
+            search_dataset(&dataset, "harvested_from zombie", 10).len(),
+            1
         );
 
         let monster = search_dataset(&dataset, "GROUP_ZOMBIE", 10)
@@ -2443,7 +3449,11 @@ mod tests {
             cache.join(build).join("all.json"),
             r#"[
                 {"type":"GENERIC","id":"long_pole","name":"long pole"},
-                {"type":"construction","id":"constr_long_pole_rack","using":[["long_pole", 1]]}
+                {"type":"construction","id":"constr_long_pole_rack","using":[["long_pole", 1]]},
+                {"type":"mapgen","id":"test_house","place_items":[{"item":"long_pole","x":1,"y":2}]},
+                {"type":"map_extra","id":"mx_pole_cache","items":[["long_pole", 100]]},
+                {"type":"overmap_special","id":"oms_pole_yard","locations":["field"],"city_distance":[0,4],"items":["long_pole"]},
+                {"type":"effect_on_condition","id":"EOC_GRANT_POLE","effect":[{"u_add_item":"long_pole"}]}
             ]"#,
         )
         .expect("all cache");
@@ -2455,6 +3465,20 @@ mod tests {
             .expect("long pole");
         assert!(pole.fields.iter().any(|(key, value)| {
             key == "referenced_by" && value.contains("construction:constr_long_pole_rack")
+        }));
+        assert!(
+            pole.fields
+                .iter()
+                .any(|(key, value)| { key == "placed_by_mapgen" && value == "mapgen:test_house" })
+        );
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "placed_by_map_extra" && value == "map_extra:mx_pole_cache"
+        }));
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "placed_by_overmap_special" && value == "overmap_special:oms_pole_yard"
+        }));
+        assert!(pole.fields.iter().any(|(key, value)| {
+            key == "referenced_by_eoc" && value == "effect_on_condition:EOC_GRANT_POLE"
         }));
 
         let _ = fs::remove_dir_all(root);
@@ -2502,6 +3526,14 @@ mod tests {
                     "construction:constr_long_pole_rack".to_string(),
                 ),
                 (
+                    "installed_as_vehicle_part".to_string(),
+                    "vehicle_part:wheel_bicycle".to_string(),
+                ),
+                (
+                    "placed_by_mapgen".to_string(),
+                    "mapgen:test_house".to_string(),
+                ),
+                (
                     "used_by_recipe".to_string(),
                     "stick_long -> long_pole".to_string(),
                 ),
@@ -2519,10 +3551,15 @@ mod tests {
 
         let targets = relation_target_ids(&result);
         assert!(targets.contains(&"constr_long_pole_rack".to_string()));
+        assert!(targets.contains(&"wheel_bicycle".to_string()));
+        assert!(targets.contains(&"test_house".to_string()));
         assert!(targets.contains(&"stick_long".to_string()));
         assert!(targets.contains(&"mon_zombie".to_string()));
         assert!(targets.contains(&"tools_common".to_string()));
         assert!(!targets.contains(&"long_pole".to_string()));
+        assert!(!targets.contains(&"construction".to_string()));
+        assert!(!targets.contains(&"mapgen".to_string()));
+        assert!(!targets.contains(&"vehicle_part".to_string()));
         assert!(!targets.contains(&"collection".to_string()));
         assert!(!targets.contains(&"death_drops".to_string()));
     }
@@ -2609,6 +3646,56 @@ mod tests {
     }
 
     #[test]
+    fn add_local_tile_info_uses_looks_like_tile_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-tile-fallback-test-{}",
+            std::process::id()
+        ));
+        let build = "test-build";
+        let tileset = build_dir(&root, build).join("gfx").join("FallbackTiles");
+        fs::create_dir_all(&tileset).expect("tileset dir");
+        fs::write(
+            tileset.join("tile_config.json"),
+            r#"{
+                "tile_info": [{"width": 16, "height": 16}],
+                "tiles-new": [
+                    {
+                        "file": "items.png",
+                        "tiles": [
+                            {"id": "stick_long", "fg": 3}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("tile config");
+        let image = image::RgbaImage::from_pixel(64, 16, image::Rgba([0, 0, 255, 255]));
+        image.save(tileset.join("items.png")).expect("png image");
+
+        let mut result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: vec![("looks_like".to_string(), "stick_long".to_string())],
+            raw_json: String::new(),
+        };
+        add_local_tile_info(&root, build, &mut result);
+
+        let tile = result
+            .fields
+            .iter()
+            .find_map(|(key, value)| (key == "tile_match").then_some(value))
+            .expect("tile match");
+        assert!(tile.contains("matched_id: stick_long"));
+        assert!(tile.contains("FallbackTiles"));
+        assert!(tile.contains("fg_crop: 48,0 16x16"));
+        assert!(tile.contains("fg_preview:"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn add_local_tile_info_exports_array_fg_and_bg_previews() {
         let root = std::env::temp_dir().join(format!(
             "cddock-guide-tile-array-test-{}",
@@ -2625,7 +3712,14 @@ mod tests {
                     {
                         "file": "items.png",
                         "tiles": [
-                            {"id": "long_pole", "fg": [5, 6], "bg": {"sprite": 2}}
+                            {
+                                "id": "long_pole",
+                                "fg": [5, 6],
+                                "bg": {"sprite": 2},
+                                "additional_tiles": [
+                                    {"id": "open", "fg": 7, "bg": 1}
+                                ]
+                            }
                         ]
                     }
                 ]
@@ -2652,7 +3746,9 @@ mod tests {
             .expect("tile match");
         assert!(tile.contains("fg_crop: 16,16 16x16"));
         assert!(tile.contains("bg_crop: 32,0 16x16"));
-        assert_eq!(tile.matches("preview:").count(), 2);
+        assert!(tile.contains("additional_open_fg_crop: 48,16 16x16"));
+        assert!(tile.contains("additional_open_bg_crop: 16,0 16x16"));
+        assert_eq!(tile.matches("preview:").count(), 4);
 
         let _ = fs::remove_dir_all(root);
     }

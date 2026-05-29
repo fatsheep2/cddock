@@ -2248,7 +2248,10 @@ fn draw_guide_detail(
     if !detail.description.is_empty() {
         lines.push(kv_line("DESC", detail.description.clone(), Color::Gray));
     }
-    for path in guide_preview_paths(detail).into_iter().take(3) {
+    for path in guide_preview_paths(detail)
+        .into_iter()
+        .take(GUIDE_PREVIEW_LIMIT)
+    {
         lines.push(kv_line(
             "SPRITE",
             sprite_preview_label(&path),
@@ -2279,13 +2282,7 @@ fn draw_guide_detail(
     push_tile_field_group(&mut lines, detail);
     push_remaining_fields(&mut lines, detail);
     if !detail.raw_json.is_empty() {
-        let mut raw = detail.raw_json.clone();
-        const RAW_LIMIT: usize = 900;
-        if raw.len() > RAW_LIMIT {
-            raw.truncate(RAW_LIMIT);
-            raw.push_str(" ...");
-        }
-        lines.push(kv_line("RAW", raw, Color::DarkGray));
+        push_raw_json_lines(&mut lines, &detail.raw_json);
     }
 
     let paragraph = Paragraph::new(lines)
@@ -2319,6 +2316,7 @@ const BASIC_GUIDE_FIELDS: &[&str] = &[
     "flags",
 ];
 const USE_GUIDE_FIELDS: &[&str] = &[
+    "use_action_summary",
     "use_action",
     "ammo",
     "ammo_effects",
@@ -2326,15 +2324,23 @@ const USE_GUIDE_FIELDS: &[&str] = &[
     "pocket_summary",
     "pocket_data",
     "container_data",
+    "armor_summary",
+    "gun_summary",
+    "tool_summary",
+    "magazine_summary",
+    "book_summary",
     "qualities",
     "techniques",
 ];
 const COMBAT_GUIDE_FIELDS: &[&str] = &[
+    "melee_summary",
     "range",
     "dispersion",
     "recoil",
     "damage",
+    "melee_damage",
     "to_hit",
+    "attack_cost",
     "bashing",
     "cutting",
     "armor_bash",
@@ -2344,6 +2350,8 @@ const COMBAT_GUIDE_FIELDS: &[&str] = &[
     "armor_fire",
 ];
 const FOOD_GUIDE_FIELDS: &[&str] = &[
+    "comestible_summary",
+    "seed_summary",
     "calories",
     "quench",
     "healthy",
@@ -2390,6 +2398,14 @@ const REL_GUIDE_FIELDS: &[&str] = &[
     "magazine_for",
     "ammo_contained_by",
     "contains_ammo",
+    "used_in_construction",
+    "tool_for_construction",
+    "installed_as_vehicle_part",
+    "placed_by_mapgen",
+    "placed_by_map_extra",
+    "placed_by_overmap_special",
+    "referenced_by_eoc",
+    "harvested_from",
     "found_in_group",
     "monster_source",
     "monster_group",
@@ -2406,6 +2422,7 @@ const TILE_GUIDE_FIELDS: &[&str] = &[
     "additional_tiles",
     "fallback",
 ];
+const GUIDE_PREVIEW_LIMIT: usize = 6;
 
 fn push_field_group(
     lines: &mut Vec<Line<'static>>,
@@ -2472,6 +2489,20 @@ fn push_remaining_fields(lines: &mut Vec<Line<'static>>, detail: &guide::GuideSe
             lines.push(kv_line("DATA", format!("{key}: {value}"), Color::Gray));
         }
     }
+}
+
+fn push_raw_json_lines(lines: &mut Vec<Line<'static>>, raw_json: &str) {
+    for (index, line) in raw_json_display_lines(raw_json).into_iter().enumerate() {
+        if index == 0 {
+            lines.push(kv_line("RAW", line, Color::DarkGray));
+        } else {
+            lines.push(kv_line("RAW", format!("  {line}"), Color::DarkGray));
+        }
+    }
+}
+
+fn raw_json_display_lines(raw_json: &str) -> Vec<String> {
+    raw_json.lines().map(str::to_string).collect()
 }
 
 fn is_grouped_guide_field(key: &str) -> bool {
@@ -2935,8 +2966,15 @@ build_channels = "exp-1=experimental,0.H=stable"
             description: String::new(),
             fields: vec![(
                 "tile_match".to_string(),
-                "tileset: Test; fg_preview: /tmp/fg.png; bg_preview: /tmp/bg.png; fg: 42"
-                    .to_string(),
+                concat!(
+                    "tileset: Test; ",
+                    "fg_preview: /tmp/fg.png; ",
+                    "bg_preview: /tmp/bg.png; ",
+                    "additional_open_fg_preview: /tmp/open-fg.png; ",
+                    "additional_open_bg_preview: /tmp/open-bg.png; ",
+                    "fg: 42"
+                )
+                .to_string(),
             )],
             raw_json: String::new(),
         };
@@ -2944,8 +2982,18 @@ build_channels = "exp-1=experimental,0.H=stable"
         let paths = guide_preview_paths(&detail);
         assert_eq!(
             paths,
-            vec![PathBuf::from("/tmp/fg.png"), PathBuf::from("/tmp/bg.png")]
+            vec![
+                PathBuf::from("/tmp/fg.png"),
+                PathBuf::from("/tmp/bg.png"),
+                PathBuf::from("/tmp/open-fg.png"),
+                PathBuf::from("/tmp/open-bg.png")
+            ]
         );
+    }
+
+    #[test]
+    fn guide_preview_limit_shows_layered_tile_states() {
+        assert_eq!(GUIDE_PREVIEW_LIMIT, 6);
     }
 
     #[test]
@@ -2964,6 +3012,20 @@ build_channels = "exp-1=experimental,0.H=stable"
 
         let display = tile_display_value(value);
         assert_eq!(display, "tileset: Test; fg_crop: 16,16 16x16");
+    }
+
+    #[test]
+    fn raw_json_display_lines_keep_full_detail() {
+        let raw = format!(
+            "{{\n  \"id\": \"long_pole\",\n  \"description\": \"{}\"\n}}",
+            "x".repeat(1200)
+        );
+
+        let lines = raw_json_display_lines(&raw);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].contains(&"x".repeat(1200)));
+        assert!(!lines.iter().any(|line| line.ends_with(" ...")));
     }
 
     #[test]
