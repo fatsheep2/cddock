@@ -2299,6 +2299,7 @@ fn draw_guide_detail(
 const BASIC_GUIDE_FIELDS: &[&str] = &[
     "abstract",
     "copy-from",
+    "_source_file",
     "looks_like",
     "category",
     "subcategory",
@@ -2313,7 +2314,9 @@ const BASIC_GUIDE_FIELDS: &[&str] = &[
     "charges",
     "stack_size",
     "material",
+    "material_summary",
     "flags",
+    "flag_summary",
 ];
 const USE_GUIDE_FIELDS: &[&str] = &[
     "use_action_summary",
@@ -2329,11 +2332,14 @@ const USE_GUIDE_FIELDS: &[&str] = &[
     "tool_summary",
     "magazine_summary",
     "book_summary",
+    "skill_summary",
     "qualities",
+    "quality_summary",
     "techniques",
 ];
 const COMBAT_GUIDE_FIELDS: &[&str] = &[
     "melee_summary",
+    "technique_summary",
     "range",
     "dispersion",
     "recoil",
@@ -2356,6 +2362,7 @@ const FOOD_GUIDE_FIELDS: &[&str] = &[
     "quench",
     "healthy",
     "vitamins",
+    "vitamin_summary",
     "comestible_type",
     "fun",
     "addiction_type",
@@ -2378,6 +2385,7 @@ const CRAFT_GUIDE_FIELDS: &[&str] = &[
     "difficulty",
     "skills",
     "proficiencies",
+    "proficiency_summary",
     "components",
     "result",
     "byproducts",

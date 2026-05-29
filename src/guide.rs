@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     http,
-    paths::{build_dir, guide_cache_dir},
+    paths::{build_dir, guide_cache_dir, shared_userdata_dir},
 };
 
 const BUILDS_URL: &str = "https://raw.githubusercontent.com/nornagon/cdda-data/main/builds.json";
@@ -305,13 +305,13 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
     if active_build.trim().is_empty() {
         return;
     }
-    let build_path = build_dir(game_root, active_build);
     let preview_dir = guide_cache_dir(game_root)
         .join("tiles")
         .join(safe_file_name(&result.id));
     let mut matches = Vec::new();
     for candidate in tile_lookup_ids(result) {
-        let candidate_matches = find_tile_matches(&build_path, &candidate, &preview_dir);
+        let candidate_matches =
+            find_tile_matches(game_root, active_build, &candidate, &preview_dir);
         for item in candidate_matches {
             let item = if candidate == result.id {
                 item
@@ -330,7 +330,7 @@ pub fn add_local_tile_info(game_root: &Path, active_build: &str, result: &mut Gu
         result.fields.push((
             "tile_match".to_string(),
             format!(
-                "no local tileset entry found for {} or looks_like ids under active build gfx/",
+                "no local tileset entry found for {} or looks_like ids under active build gfx/ or userdata/gfx/",
                 result.id
             ),
         ));
@@ -356,15 +356,35 @@ fn tile_lookup_ids(result: &GuideSearchResult) -> Vec<String> {
     ids
 }
 
-fn find_tile_matches(build_path: &Path, id: &str, preview_dir: &Path) -> Vec<String> {
-    let gfx = build_path.join("gfx");
-    if !gfx.is_dir() {
-        return Vec::new();
-    }
-
+fn find_tile_matches(
+    game_root: &Path,
+    active_build: &str,
+    id: &str,
+    preview_dir: &Path,
+) -> Vec<String> {
     let mut matches = Vec::new();
+    for gfx in local_gfx_dirs(game_root, active_build) {
+        collect_gfx_tile_matches(&gfx, id, preview_dir, &mut matches);
+    }
+    matches
+}
+
+fn local_gfx_dirs(game_root: &Path, active_build: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for dir in [
+        build_dir(game_root, active_build).join("gfx"),
+        shared_userdata_dir(game_root).join("gfx"),
+    ] {
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+fn collect_gfx_tile_matches(gfx: &Path, id: &str, preview_dir: &Path, matches: &mut Vec<String>) {
     let Ok(tilesets) = fs::read_dir(gfx) else {
-        return matches;
+        return;
     };
     for entry in tilesets.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -393,10 +413,9 @@ fn find_tile_matches(build_path: &Path, id: &str, preview_dir: &Path) -> Vec<Str
             None,
             tile_size,
             preview_dir,
-            &mut matches,
+            matches,
         );
     }
-    matches
 }
 
 fn collect_tile_matches(
@@ -647,6 +666,15 @@ fn load_translations_with_fallback(
 
     match build_has_language(game_root, build, language) {
         Ok(false) => {
+            if let Ok(translations) = load_local_translations(game_root, build, language) {
+                return (
+                    translations,
+                    language.to_string(),
+                    Some(format!(
+                        "Guide language {language} is not listed for {build}; using installed game translations."
+                    )),
+                );
+            }
             return (
                 HashMap::new(),
                 "en".to_string(),
@@ -694,6 +722,12 @@ fn build_has_language(game_root: &Path, build: &str, language: &str) -> Result<b
     Ok(item.langs.iter().any(|lang| lang == language))
 }
 fn load_json(game_root: &Path, build: &str, relative: &str) -> Result<Value, String> {
+    if relative == "all.json"
+        && let Ok(value) = load_local_all_json(game_root, build)
+    {
+        return Ok(value);
+    }
+
     let url = format!("{DATA_BASE_URL}/{build}/{relative}");
     let cache_path = guide_cache_dir(game_root).join(build).join(relative);
     let text = fetch_cached(&url, &cache_path)?;
@@ -705,6 +739,131 @@ fn load_json(game_root: &Path, build: &str, relative: &str) -> Result<Value, Str
     })
 }
 
+fn load_local_all_json(game_root: &Path, build: &str) -> Result<Value, String> {
+    let mut errors = Vec::new();
+    let mut values = Vec::new();
+    for data_dir in local_data_dirs(game_root, build) {
+        let mut files = Vec::new();
+        collect_json_files(&data_dir, &mut files).map_err(|error| {
+            format!(
+                "Failed to read local data dir {}: {error}",
+                data_dir.display()
+            )
+        })?;
+        files.sort();
+
+        for file in files {
+            match fs::read_to_string(&file)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())
+                }) {
+                Ok(Value::Array(items)) => values.extend(
+                    items
+                        .into_iter()
+                        .map(|value| attach_source_file(value, &file, game_root)),
+                ),
+                Ok(value @ Value::Object(_)) => {
+                    values.push(attach_source_file(value, &file, game_root))
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if errors.len() < 3 {
+                        errors.push(format!("{}: {error}", file.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    if !values.is_empty() {
+        return Ok(Value::Array(values));
+    }
+
+    if errors.is_empty() {
+        Err(format!("No local CDDA data/json found for {build}"))
+    } else {
+        Err(format!(
+            "No parseable local CDDA JSON found for {build}: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn local_data_dirs(game_root: &Path, build: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut candidates = vec![build.to_string()];
+    if let Some(stripped) = build.strip_suffix("-RELEASE") {
+        candidates.push(stripped.to_string());
+    }
+    if let Some(stripped) = build.strip_prefix("cdda-") {
+        candidates.push(stripped.to_string());
+    }
+
+    for candidate in candidates {
+        push_local_data_dirs(&mut dirs, &build_dir(game_root, &candidate));
+    }
+
+    let versions = game_root.join("versions");
+    if let Ok(entries) = fs::read_dir(versions) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == build || name.starts_with(build) || build.starts_with(&name) {
+                push_local_data_dirs(&mut dirs, &entry.path());
+            }
+        }
+    }
+
+    dirs
+}
+
+fn push_local_data_dirs(dirs: &mut Vec<PathBuf>, build_path: &Path) {
+    for data in [
+        build_path.join("data").join("json"),
+        build_path.join("data").join("mods"),
+    ] {
+        if data.is_dir() && !dirs.contains(&data) {
+            dirs.push(data);
+        }
+    }
+}
+
+fn attach_source_file(mut value: Value, file: &Path, game_root: &Path) -> Value {
+    if let Value::Object(map) = &mut value {
+        let source = file
+            .strip_prefix(game_root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        map.entry("_source_file".to_string())
+            .or_insert_with(|| Value::String(source));
+    }
+    value
+}
+
+fn collect_json_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_json_files(&entry.path(), files)?;
+        } else if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
 fn load_translations(
     game_root: &Path,
     build: &str,
@@ -712,6 +871,10 @@ fn load_translations(
 ) -> Result<HashMap<String, String>, String> {
     if language == "en" {
         return Ok(HashMap::new());
+    }
+
+    if let Ok(translations) = load_local_translations(game_root, build, language) {
+        return Ok(translations);
     }
 
     let url = format!("{DATA_BASE_URL}/{build}/lang/{language}.json");
@@ -739,6 +902,125 @@ fn load_translations(
         }
     }
     Ok(translations)
+}
+
+fn load_local_translations(
+    game_root: &Path,
+    build: &str,
+    language: &str,
+) -> Result<HashMap<String, String>, String> {
+    for path in local_translation_paths(game_root, build, language) {
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Failed to read local translation {}: {error}",
+                path.display()
+            )
+        })?;
+        let translations = parse_po_translations(&text);
+        if !translations.is_empty() {
+            return Ok(translations);
+        }
+    }
+    Err(format!(
+        "No local {language} translation file found for {build}"
+    ))
+}
+
+fn local_translation_paths(game_root: &Path, build: &str, language: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut candidates = vec![build.to_string()];
+    if let Some(stripped) = build.strip_suffix("-RELEASE") {
+        candidates.push(stripped.to_string());
+    }
+    if let Some(stripped) = build.strip_prefix("cdda-") {
+        candidates.push(stripped.to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    for candidate in candidates {
+        let root = build_dir(game_root, &candidate).join("lang").join("po");
+        for path in [
+            root.join(format!("{language}.po")),
+            root.join(language)
+                .join("LC_MESSAGES")
+                .join("cataclysm-dda.po"),
+            root.join(language).join("cataclysm-dda.po"),
+        ] {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn parse_po_translations(text: &str) -> HashMap<String, String> {
+    let mut translations = HashMap::new();
+    let mut current_key: Option<String> = None;
+    let mut current_value: Option<String> = None;
+    let mut active = PoField::None;
+
+    for line in text.lines().chain(std::iter::once("")) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let (Some(key), Some(value)) = (current_key.take(), current_value.take())
+                && !key.is_empty()
+                && !value.is_empty()
+            {
+                translations.insert(key, value);
+            }
+            active = PoField::None;
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("msgid ") {
+            current_key = po_quoted(rest);
+            current_value = None;
+            active = PoField::MsgId;
+        } else if let Some(rest) = trimmed.strip_prefix("msgstr ") {
+            current_value = po_quoted(rest);
+            active = PoField::MsgStr;
+        } else if trimmed.starts_with("msgctxt ") || trimmed.starts_with("msgid_plural ") {
+            active = PoField::None;
+        } else if let Some(extra) = po_quoted(trimmed) {
+            match active {
+                PoField::MsgId => {
+                    if let Some(key) = current_key.as_mut() {
+                        key.push_str(&extra);
+                    }
+                }
+                PoField::MsgStr => {
+                    if let Some(value) = current_value.as_mut() {
+                        value.push_str(&extra);
+                    }
+                }
+                PoField::None => {}
+            }
+        }
+    }
+
+    translations
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PoField {
+    None,
+    MsgId,
+    MsgStr,
+}
+
+fn po_quoted(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.starts_with('"') || !value.ends_with('"') {
+        return None;
+    }
+    serde_json::from_str::<String>(value).ok()
 }
 
 fn fetch_cached(url: &str, cache_path: &Path) -> Result<String, String> {
@@ -791,11 +1073,11 @@ fn collect_entries(
 
 fn object_id_index<'a>(
     objects: &[&'a Map<String, Value>],
-    translations: &HashMap<String, String>,
+    _translations: &HashMap<String, String>,
 ) -> HashMap<String, &'a Map<String, Value>> {
     let mut index = HashMap::new();
     for map in objects {
-        if let Some(id) = field_text(map, "id", translations) {
+        if let Some(id) = raw_field_text(map, "id") {
             index.entry(id).or_insert(*map);
         }
     }
@@ -813,7 +1095,7 @@ fn resolve_copy_from(
     }
     let mut resolved = map
         .get("copy-from")
-        .and_then(|value| compact_value(value, translations))
+        .and_then(raw_value_text)
         .and_then(|parent_id| object_index.get(&parent_id).copied())
         .map(|parent| resolve_copy_from(parent, object_index, translations, depth + 1))
         .unwrap_or_default();
@@ -985,7 +1267,7 @@ fn object_to_result(
     map: &Map<String, Value>,
     translations: &HashMap<String, String>,
 ) -> Option<GuideSearchResult> {
-    let kind = field_text(map, "type", translations).unwrap_or_else(|| "entry".to_string());
+    let kind = raw_field_text(map, "type").unwrap_or_else(|| "entry".to_string());
     let id = object_identity_id(map, &kind, translations)?;
     let name = field_text(map, "name", translations).unwrap_or_else(|| id.clone());
     let description = field_text(map, "description", translations).unwrap_or_default();
@@ -994,6 +1276,7 @@ fn object_to_result(
     const PRIMARY_FIELDS: &[&str] = &[
         "abstract",
         "copy-from",
+        "_source_file",
         "looks_like",
         "category",
         "subcategory",
@@ -1075,6 +1358,9 @@ fn object_to_result(
     }
     for summary in pocket_summaries(map.get("pocket_data"), translations) {
         fields.push(("pocket_summary".to_string(), summary));
+    }
+    for summary in quality_summaries(map.get("qualities"), translations) {
+        fields.push(("quality_summary".to_string(), summary));
     }
     for summary in object_section_summaries(
         map.get("armor_data"),
@@ -1227,13 +1513,13 @@ fn object_to_result(
 fn object_identity_id(
     map: &Map<String, Value>,
     kind: &str,
-    translations: &HashMap<String, String>,
+    _translations: &HashMap<String, String>,
 ) -> Option<String> {
-    field_text(map, "id", translations).or_else(|| match kind {
+    raw_field_text(map, "id").or_else(|| match kind {
         "recipe" | "uncraft" => {
-            field_text(map, "result", translations).map(|result| format!("{kind}/{result}"))
+            raw_field_text(map, "result").map(|result| format!("{kind}/{result}"))
         }
-        "monstergroup" => field_text(map, "name", translations),
+        "monstergroup" => raw_field_text(map, "name"),
         _ => None,
     })
 }
@@ -1369,6 +1655,41 @@ fn pocket_summary(value: &Value, translations: &HashMap<String, String>) -> Opti
     }
 }
 
+fn quality_summaries(value: Option<&Value>, translations: &HashMap<String, String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| quality_summary(value, translations))
+            .collect(),
+        _ => quality_summary(value, translations).into_iter().collect(),
+    }
+}
+
+fn quality_summary(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
+    match value {
+        Value::Array(values) if values.len() >= 2 => {
+            let quality = compact_value(&values[0], translations)?;
+            let level = compact_value(&values[1], translations)?;
+            Some(format!("{quality}: level {level}"))
+        }
+        Value::Object(map) => {
+            let quality = map
+                .get("id")
+                .or_else(|| map.get("quality"))
+                .and_then(|value| compact_value(value, translations))?;
+            let level = map
+                .get("level")
+                .and_then(|value| compact_value(value, translations))
+                .unwrap_or_else(|| "1".to_string());
+            Some(format!("{quality}: level {level}"))
+        }
+        _ => compact_value(value, translations),
+    }
+}
+
 fn object_section_summaries(
     value: Option<&Value>,
     translations: &HashMap<String, String>,
@@ -1436,11 +1757,9 @@ fn add_derived_fields(
     let requirement_index = requirement_index(objects, translations);
     let quality_index = quality_index(objects, translations);
     let harvest_sources = harvest_source_index(objects, translations);
+    add_definition_summary_fields(objects, entries, &index, translations);
     for map in objects {
-        let kind = map
-            .get("type")
-            .and_then(|value| compact_value(value, translations))
-            .unwrap_or_default();
+        let kind = raw_field_text(map, "type").unwrap_or_default();
         match kind.as_str() {
             "recipe" => add_recipe_fields(
                 map,
@@ -1478,6 +1797,266 @@ fn add_derived_fields(
         add_ammo_magazine_fields(map, entries, &index, translations);
     }
     add_cross_reference_fields(objects, entries, &index, translations);
+}
+
+fn add_definition_summary_fields(
+    objects: &[Map<String, Value>],
+    entries: &mut [GuideSearchResult],
+    index: &HashMap<String, usize>,
+    translations: &HashMap<String, String>,
+) {
+    let flag_definitions = definition_index(objects, translations, "json_flag");
+    let technique_definitions = definition_index(objects, translations, "technique");
+    let material_definitions = material_definition_index(objects, translations);
+    let skill_definitions = definition_index(objects, translations, "skill");
+    let proficiency_definitions = definition_index(objects, translations, "proficiency");
+    let vitamin_definitions = definition_index(objects, translations, "vitamin");
+    for map in objects {
+        let kind = raw_field_text(map, "type").unwrap_or_default();
+        let Some(source_id) = object_identity_id(map, &kind, translations) else {
+            continue;
+        };
+        for flag in map
+            .get("flags")
+            .map(extract_string_tokens)
+            .unwrap_or_default()
+        {
+            if let Some(summary) = flag_definitions.get(&flag) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "flag_summary",
+                    &format!("{flag}: {summary}"),
+                );
+            }
+        }
+        for material in material_tokens(map) {
+            if let Some(summary) = material_definitions.get(&material) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "material_summary",
+                    &format!("{material}: {summary}"),
+                );
+            }
+        }
+        for skill in definition_field_tokens(map, &["skill", "skills", "melee_skill"]) {
+            if let Some(summary) = skill_definitions.get(&skill) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "skill_summary",
+                    &format!("{skill}: {summary}"),
+                );
+            }
+        }
+        for proficiency in definition_field_tokens(map, &["proficiency", "proficiencies"]) {
+            if let Some(summary) = proficiency_definitions.get(&proficiency) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "proficiency_summary",
+                    &format!("{proficiency}: {summary}"),
+                );
+            }
+        }
+        for vitamin in definition_field_tokens(map, &["vitamins"]) {
+            if let Some(summary) = vitamin_definitions.get(&vitamin) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "vitamin_summary",
+                    &format!("{vitamin}: {summary}"),
+                );
+            }
+        }
+        for technique in map
+            .get("techniques")
+            .map(extract_string_tokens)
+            .unwrap_or_default()
+        {
+            if let Some(summary) = technique_definitions.get(&technique) {
+                push_relation(
+                    entries,
+                    index,
+                    &source_id,
+                    "technique_summary",
+                    &format!("{technique}: {summary}"),
+                );
+            }
+        }
+    }
+}
+
+fn definition_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+    expected_kind: &str,
+) -> HashMap<String, String> {
+    let mut definitions = HashMap::new();
+    for map in objects {
+        let kind = raw_field_text(map, "type").unwrap_or_default();
+        if kind != expected_kind {
+            continue;
+        }
+        let Some(id) = raw_field_text(map, "id") else {
+            continue;
+        };
+        if let Some(summary) = definition_summary(map, &id, translations) {
+            definitions.insert(id, summary);
+        }
+    }
+    definitions
+}
+
+fn material_definition_index(
+    objects: &[Map<String, Value>],
+    translations: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut definitions = HashMap::new();
+    for map in objects {
+        let kind = raw_field_text(map, "type").unwrap_or_default();
+        if kind != "material" {
+            continue;
+        }
+        let Some(id) = raw_field_text(map, "id") else {
+            continue;
+        };
+        if let Some(summary) = material_definition_summary(map, &id, translations) {
+            definitions.insert(id, summary);
+        }
+    }
+    definitions
+}
+
+fn material_definition_summary(
+    map: &Map<String, Value>,
+    id: &str,
+    translations: &HashMap<String, String>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(name) = map
+        .get("name")
+        .and_then(|value| compact_value(value, translations))
+        .filter(|name| name != id)
+    {
+        parts.push(name);
+    }
+    for (key, label) in [
+        ("density", "density"),
+        ("specific_heat_liquid", "specific heat"),
+        ("specific_heat_solid", "specific heat solid"),
+        ("latent_heat", "latent heat"),
+        ("bash_resist", "bash resist"),
+        ("cut_resist", "cut resist"),
+        ("acid_resist", "acid resist"),
+        ("elec_resist", "elec resist"),
+        ("fire_resist", "fire resist"),
+        ("chip_resist", "chip resist"),
+        ("bash_dmg_verb", "bash verb"),
+        ("cut_dmg_verb", "cut verb"),
+        ("dmg_adj", "damage adj"),
+        ("burn_data", "burn"),
+        ("repaired_with", "repaired with"),
+        ("edible", "edible"),
+        ("rotting", "rotting"),
+    ] {
+        if let Some(value) = field_text(map, key, translations) {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn material_tokens(map: &Map<String, Value>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    collect_material_tokens(&Value::Object(map.clone()), &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn collect_material_tokens(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "material" {
+                    tokens.extend(extract_string_tokens(child));
+                }
+                collect_material_tokens(child, tokens);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_material_tokens(child, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn definition_field_tokens(map: &Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    collect_definition_field_tokens(&Value::Object(map.clone()), keys, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn collect_definition_field_tokens(value: &Value, keys: &[&str], tokens: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if keys.iter().any(|candidate| candidate == key) {
+                    tokens.extend(extract_string_tokens(child));
+                }
+                collect_definition_field_tokens(child, keys, tokens);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_definition_field_tokens(child, keys, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn definition_summary(
+    map: &Map<String, Value>,
+    id: &str,
+    translations: &HashMap<String, String>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(name) = map
+        .get("name")
+        .and_then(|value| compact_value(value, translations))
+        .filter(|name| name != id)
+    {
+        parts.push(name);
+    }
+    for key in ["info", "description"] {
+        if let Some(value) = map
+            .get(key)
+            .and_then(|value| compact_value(value, translations))
+        {
+            parts.push(value);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 fn item_group_index(
@@ -2425,6 +3004,14 @@ fn field_text(
     compact_value(value, translations)
 }
 
+fn raw_field_text(map: &Map<String, Value>, key: &str) -> Option<String> {
+    map.get(key).and_then(raw_value_text)
+}
+
+fn raw_value_text(value: &Value) -> Option<String> {
+    compact_value(value, &HashMap::new())
+}
+
 fn damage_value_text(value: &Value, translations: &HashMap<String, String>) -> Option<String> {
     match value {
         Value::Array(values) => {
@@ -2539,6 +3126,124 @@ mod tests {
     }
 
     #[test]
+    fn load_dataset_uses_local_po_when_guide_language_is_missing() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-local-po-test-{}", std::process::id()));
+        let build = "cdda-0.I-2026-03-05-0143";
+        let cache = guide_cache_dir(&root);
+        fs::create_dir_all(cache.join(build)).expect("cache dir");
+        fs::write(
+            cache.join("builds.json"),
+            format!(r#"[{{"build_number":"{build}","prerelease":true,"langs":[]}}]"#),
+        )
+        .expect("builds cache");
+        fs::write(
+            cache.join(build).join("all.json"),
+            r#"[{"type":"GENERIC","id":"hammer","name":"hammer","description":"A sturdy hammer."}]"#,
+        )
+        .expect("all cache");
+        let po_dir = build_dir(&root, build).join("lang").join("po");
+        fs::create_dir_all(&po_dir).expect("po dir");
+        fs::write(
+            po_dir.join("zh_CN.po"),
+            r#"
+msgid "hammer"
+msgstr "锤子"
+
+msgid ""
+"A sturdy "
+"hammer."
+msgstr "一把结实的锤子。"
+"#,
+        )
+        .expect("po file");
+
+        let dataset = load_dataset(&root, build, "zh_CN").expect("dataset");
+        assert_eq!(dataset.language(), "zh_CN");
+        assert!(
+            dataset
+                .warning()
+                .is_some_and(|warning| warning.contains("installed game translations"))
+        );
+        let hammer = dataset.get("hammer").expect("hammer");
+        assert_eq!(hammer.name, "锤子");
+        assert_eq!(hammer.description, "一把结实的锤子。");
+        assert_eq!(search_dataset(&dataset, "锤子", 10).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dataset_reads_installed_game_json_before_remote_guide() {
+        let root =
+            std::env::temp_dir().join(format!("cddock-guide-local-test-{}", std::process::id()));
+        let build = "local-build";
+        let data = build_dir(&root, build).join("data").join("json");
+        fs::create_dir_all(&data).expect("local data dir");
+        let mod_data = build_dir(&root, build)
+            .join("data")
+            .join("mods")
+            .join("test_mod");
+        fs::create_dir_all(&mod_data).expect("mod data dir");
+        fs::write(
+            data.join("items.json"),
+            r#"[
+                {
+                    "type":"GENERIC",
+                    "id":"local_pole",
+                    "name":"local pole",
+                    "flags":["LOCAL_FLAG"],
+                    "qualities":[["HAMMER",2]]
+                },
+                {
+                    "type":"json_flag",
+                    "id":"LOCAL_FLAG",
+                    "info":"Only present in the installed local build."
+                }
+            ]"#,
+        )
+        .expect("local json");
+        fs::write(
+            mod_data.join("items.json"),
+            r#"[{"type":"GENERIC","id":"mod_pole","name":"mod pole"}]"#,
+        )
+        .expect("mod json");
+
+        let dataset = load_dataset(&root, build, "en").expect("dataset");
+        let item = dataset.get("local_pole").expect("local item");
+        assert_eq!(item.name, "local pole");
+        assert!(item.fields.iter().any(|(key, value)| {
+            key == "flag_summary" && value.contains("installed local build")
+        }));
+        assert!(
+            item.fields
+                .iter()
+                .any(|(key, value)| { key == "quality_summary" && value == "HAMMER: level 2" })
+        );
+        assert_eq!(
+            search_dataset(&dataset, "flag_summary installed", 10).len(),
+            1
+        );
+        assert!(item.fields.iter().any(|(key, value)| {
+            key == "_source_file" && value.ends_with("data/json/items.json")
+        }));
+        assert_eq!(dataset.get("mod_pole").expect("mod item").name, "mod pole");
+        assert!(
+            dataset
+                .get("mod_pole")
+                .expect("mod item")
+                .fields
+                .iter()
+                .any(|(key, value)| {
+                    key == "_source_file" && value.ends_with("data/mods/test_mod/items.json")
+                })
+        );
+        assert_eq!(search_dataset(&dataset, "mod_pole", 10).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn load_dataset_indexes_unlisted_detail_fields() {
         let root =
             std::env::temp_dir().join(format!("cddock-guide-fields-test-{}", std::process::id()));
@@ -2611,10 +3316,34 @@ mod tests {
                     "type":"GENERIC",
                     "id":"combat_knife",
                     "name":"combat knife",
+                    "flags":["SHEATH_KNIFE"],
+                    "material":["steel"],
+                    "qualities":[["CUT",1]],
                     "melee_damage":[{"damage_type":"cut","amount":18},{"damage_type":"stab","amount":8}],
                     "to_hit":1,
                     "attack_cost":85,
                     "techniques":["RAPID","WBLOCK_1"]
+                },
+                {
+                    "type":"json_flag",
+                    "id":"SHEATH_KNIFE",
+                    "info":"Can be sheathed in a knife sheath."
+                },
+                {
+                    "type":"material",
+                    "id":"steel",
+                    "name":"steel",
+                    "density":7.8,
+                    "bash_resist":9,
+                    "cut_resist":10,
+                    "fire_resist":8,
+                    "repaired_with":"welder"
+                },
+                {
+                    "type":"technique",
+                    "id":"RAPID",
+                    "name":"Rapid strike",
+                    "description":"Attacks quickly."
                 },
                 {
                     "type":"TOOL",
@@ -2662,7 +3391,20 @@ mod tests {
                         "time":"30 m",
                         "fun":1,
                         "chapters":10
-                    }
+                    },
+                    "proficiencies":["prof_lockpicking"]
+                },
+                {
+                    "type":"skill",
+                    "id":"mechanics",
+                    "name":"mechanics",
+                    "description":"Repair and build mechanical devices."
+                },
+                {
+                    "type":"proficiency",
+                    "id":"prof_lockpicking",
+                    "name":"lockpicking",
+                    "description":"Knowledge of opening locks without a key."
                 },
                 {
                     "type":"COMESTIBLE",
@@ -2676,6 +3418,12 @@ mod tests {
                     "spoils_in":"never",
                     "addiction_type":"none",
                     "vitamins":[["vitC", 1]]
+                },
+                {
+                    "type":"vitamin",
+                    "id":"vitC",
+                    "name":"vitamin C",
+                    "description":"Supports immune function."
                 },
                 {
                     "type":"GENERIC",
@@ -2768,7 +3516,42 @@ mod tests {
                 && value.contains("attack cost: 85")
                 && value.contains("techniques: RAPID, WBLOCK_1")
         }));
+        assert!(knife.fields.iter().any(|(key, value)| {
+            key == "flag_summary"
+                && value.contains("SHEATH_KNIFE")
+                && value.contains("knife sheath")
+        }));
+        assert!(knife.fields.iter().any(|(key, value)| {
+            key == "material_summary"
+                && value.contains("steel")
+                && value.contains("density: 7.8")
+                && value.contains("bash resist: 9")
+                && value.contains("cut resist: 10")
+                && value.contains("repaired with: welder")
+        }));
+        assert!(knife.fields.iter().any(|(key, value)| {
+            key == "technique_summary"
+                && value.contains("RAPID")
+                && value.contains("Rapid strike")
+                && value.contains("Attacks quickly")
+        }));
+        assert!(
+            knife
+                .fields
+                .iter()
+                .any(|(key, value)| { key == "quality_summary" && value == "CUT: level 1" })
+        );
         assert_eq!(search_dataset(&dataset, "melee_summary RAPID", 10).len(), 1);
+        assert_eq!(search_dataset(&dataset, "flag_summary sheath", 10).len(), 1);
+        assert_eq!(
+            search_dataset(&dataset, "material_summary welder", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "technique_summary rapid", 10).len(),
+            1
+        );
+        assert_eq!(search_dataset(&dataset, "quality_summary CUT", 10).len(), 1);
 
         let tool = dataset.get("flashlight").expect("tool");
         assert!(tool.fields.iter().any(|(key, value)| {
@@ -2804,6 +3587,16 @@ mod tests {
                 && value.contains("int: 8")
                 && value.contains("chapters: 10")
         }));
+        assert!(book.fields.iter().any(|(key, value)| {
+            key == "skill_summary"
+                && value.contains("mechanics")
+                && value.contains("mechanical devices")
+        }));
+        assert!(book.fields.iter().any(|(key, value)| {
+            key == "proficiency_summary"
+                && value.contains("prof_lockpicking")
+                && value.contains("opening locks")
+        }));
         assert_eq!(
             search_dataset(&dataset, "tool_summary battery", 10).len(),
             1
@@ -2814,6 +3607,14 @@ mod tests {
         );
         assert_eq!(
             search_dataset(&dataset, "book_summary mechanics", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "skill_summary mechanical", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "proficiency_summary locks", 10).len(),
             1
         );
         assert_eq!(
@@ -2830,6 +3631,12 @@ mod tests {
                 && value.contains("addiction: none")
                 && value.contains("vitamins: vitC, 1")
         }));
+        assert!(aspirin.fields.iter().any(|(key, value)| {
+            key == "vitamin_summary"
+                && value.contains("vitC")
+                && value.contains("vitamin C")
+                && value.contains("immune function")
+        }));
         let seed = dataset.get("seed_corn").expect("seed");
         assert!(seed.fields.iter().any(|(key, value)| {
             key == "seed_summary"
@@ -2841,6 +3648,10 @@ mod tests {
         }));
         assert_eq!(
             search_dataset(&dataset, "comestible_summary MED", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_dataset(&dataset, "vitamin_summary immune", 10).len(),
             1
         );
         assert_eq!(search_dataset(&dataset, "seed_summary corn", 10).len(), 1);
@@ -3690,6 +4501,55 @@ mod tests {
         assert!(tile.contains("matched_id: stick_long"));
         assert!(tile.contains("FallbackTiles"));
         assert!(tile.contains("fg_crop: 48,0 16x16"));
+        assert!(tile.contains("fg_preview:"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn add_local_tile_info_reads_shared_userdata_gfx() {
+        let root = std::env::temp_dir().join(format!(
+            "cddock-guide-shared-gfx-test-{}",
+            std::process::id()
+        ));
+        let build = "test-build";
+        let tileset = shared_userdata_dir(&root).join("gfx").join("SharedTiles");
+        fs::create_dir_all(&tileset).expect("tileset dir");
+        fs::write(
+            tileset.join("tile_config.json"),
+            r#"{
+                "tile_info": [{"width": 16, "height": 16}],
+                "tiles-new": [
+                    {
+                        "file": "items.png",
+                        "tiles": [
+                            {"id": "long_pole", "fg": 2}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("tile config");
+        let image = image::RgbaImage::from_pixel(64, 16, image::Rgba([255, 255, 0, 255]));
+        image.save(tileset.join("items.png")).expect("png image");
+
+        let mut result = GuideSearchResult {
+            id: "long_pole".to_string(),
+            kind: "GENERIC".to_string(),
+            name: "long pole".to_string(),
+            description: String::new(),
+            fields: Vec::new(),
+            raw_json: String::new(),
+        };
+        add_local_tile_info(&root, build, &mut result);
+
+        let tile = result
+            .fields
+            .iter()
+            .find_map(|(key, value)| (key == "tile_match").then_some(value))
+            .expect("tile match");
+        assert!(tile.contains("SharedTiles"));
+        assert!(tile.contains("fg_crop: 32,0 16x16"));
         assert!(tile.contains("fg_preview:"));
 
         let _ = fs::remove_dir_all(root);
